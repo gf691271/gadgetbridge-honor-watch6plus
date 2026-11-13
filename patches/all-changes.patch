@@ -45,7 +45,7 @@ index 5bb5f45..abfac1a 100644
  }
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-index 096543c..835c1af 100644
+index 096543c..afe8418 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 @@ -2,10 +2,17 @@ package nodomain.freeyourgadget.gadgetbridge.database
@@ -66,7 +66,7 @@ index 096543c..835c1af 100644
  import nodomain.freeyourgadget.gadgetbridge.GBApplication
  import nodomain.freeyourgadget.gadgetbridge.GBDatabaseManager
  import nodomain.freeyourgadget.gadgetbridge.R
-@@ -13,71 +20,633 @@ import nodomain.freeyourgadget.gadgetbridge.util.GB
+@@ -13,71 +20,697 @@ import nodomain.freeyourgadget.gadgetbridge.util.GB
  import nodomain.freeyourgadget.gadgetbridge.util.GBPrefs
  import org.slf4j.Logger
  import org.slf4j.LoggerFactory
@@ -116,7 +116,12 @@ index 096543c..835c1af 100644
 +        val rows: Int,
 +        val columns: List<String>,
 +        val stats: List<ColStat>,
-+        val quality: JsonObject
++        val quality: JsonObject,
++        // Machine-readable time metadata: consumers must not have to guess the unit.
++        val timestampColumn: String? = null,
++        val timeBase: String? = null,
++        val bytes: Long = 0,
++        val sha256: String = ""
 +    )
 +
      override fun doWork(): Result {
@@ -224,8 +229,24 @@ index 096543c..835c1af 100644
 +                    var rows = 0
 +                    var prevTs = -1L
 +
-+                    mContext.contentResolver.openOutputStream(uri).use { out ->
-+                        requireNotNull(out) { "no output stream for $name" }
++                    // Wrap the stream so we can report the exact byte count and a checksum
++                    // in the manifest; consumers use these to detect truncated transfers.
++                    val digest = java.security.MessageDigest.getInstance("SHA-256")
++                    var byteCount = 0L
++                    mContext.contentResolver.openOutputStream(uri).use { raw ->
++                        requireNotNull(raw) { "no output stream for $name" }
++                        val out = object : java.io.OutputStream() {
++                            override fun write(b: Int) {
++                                raw.write(b); digest.update(b.toByte()); byteCount++
++                            }
++
++                            override fun write(b: ByteArray, off: Int, len: Int) {
++                                raw.write(b, off, len); digest.update(b, off, len); byteCount += len
++                            }
++
++                            override fun flush() { raw.flush() }
++                            override fun close() { raw.close() }
++                        }
 +                        val w = OutputStreamWriter(out, Charsets.UTF_8).buffered()
 +                        w.write("epoch_s,utc,")
 +                        w.write(usable.joinToString(",") { it.first })
@@ -259,7 +280,23 @@ index 096543c..835c1af 100644
 +                    }
 +
 +                    val quality = qualityJson(rows, stats, gaps)
-+                    written += Written(spec.kind, name, rows, usable.map { it.first }, stats, quality)
++                    val sha = digest.digest().joinToString("") { "%02x".format(it) }
++                    written += Written(
++                        kind = spec.kind,
++                        file = name,
++                        rows = rows,
++                        columns = usable.map { it.first },
++                        stats = stats,
++                        quality = quality,
++                        timestampColumn = spec.timeColumn,
++                        timeBase = when {
++                            spec.timeColumn == null -> null
++                            spec.timeInMs -> "epoch_ms"
++                            else -> "epoch_s"
++                        },
++                        bytes = byteCount,
++                        sha256 = sha
++                    )
 +                    LOG.info("Wrote {} rows x {} cols -> {}", rows, usable.size, name)
 +                } catch (e: Exception) {
 +                    LOG.error("Failed exporting table {}", spec.table, e)
@@ -367,6 +404,7 @@ index 096543c..835c1af 100644
 +                .filter { f ->
 +                    f.isFile && f.length() > 0 &&
 +                        (f.name.endsWith(".bin") ||
++                            (f.parentFile?.name == "rri" && f.name.endsWith(".csv")) ||
 +                            (f.parentFile?.name == "debugdl" && f.name.endsWith(".log")))
 +                }
 +                .sortedBy { it.name }
@@ -425,7 +463,7 @@ index 096543c..835c1af 100644
 +            root.addProperty("file_name_timezone", TimeZone.getDefault().id)
 +            root.addProperty("window_from_epoch_s", fromSec)
 +            root.addProperty("window_to_epoch_s", toSec)
-+            root.addProperty("row_time_base", "epoch_s (UTC seconds)")
++            root.addProperty("row_time_base", "epoch_s")   // the CSV epoch_s column is always UTC seconds; see files[].time for the source column unit
 +            root.addProperty("generated_by", "Gadgetbridge database auto-export (local patches)")
 +
 +            val app = JsonObject()
@@ -446,6 +484,18 @@ index 096543c..835c1af 100644
 +                f.addProperty("name", w.file)
 +                f.addProperty("kind", w.kind)
 +                f.addProperty("rows", w.rows)
++                f.addProperty("bytes", w.bytes)
++                f.addProperty("sha256", w.sha256)
++                // Explicit time metadata per file: the CSV always carries epoch_s, but the
++                // original source column may be milliseconds. Consumers must not guess.
++                val t = JsonObject()
++                t.addProperty("epoch_column", "epoch_s")
++                t.addProperty("epoch_unit", "s")
++                if (w.timestampColumn != null) {
++                    t.addProperty("source_column", w.timestampColumn)
++                    t.addProperty("source_unit", w.timeBase)
++                }
++                f.add("time", t)
 +                f.add("data_quality", w.quality)
 +                val cols = JsonArray()
 +                for (c in w.columns) cols.add(c)
@@ -471,12 +521,21 @@ index 096543c..835c1af 100644
 +            rawCopied.forEach { raw.add(it) }
 +            root.add("raw_files_new", raw)
 +
++            // Structured on purpose: downstream consumers dedup on these without parsing prose.
 +            val keys = JsonArray()
-+            keys.add("HUAWEI_ACTIVITY_SAMPLE: (TIMESTAMP, OTHER_TIMESTAMP) — plain TIMESTAMP is NOT unique")
-+            keys.add("BATTERY_LEVEL: (TIMESTAMP, BATTERY_INDEX)")
-+            keys.add("HUAWEI_WORKOUT_DATA_SAMPLE: (WORKOUT_ID, TIMESTAMP)")
-+            keys.add("BASE_ACTIVITY_SUMMARY: _id")
-+            keys.add("USER_ATTRIBUTES: _id")
++            fun addKey(table: String, vararg cols: String) {
++                val o = JsonObject()
++                o.addProperty("table", table)
++                val a = JsonArray()
++                cols.forEach { a.add(it) }
++                o.add("columns", a)
++                keys.add(o)
++            }
++            addKey("HUAWEI_ACTIVITY_SAMPLE", "TIMESTAMP", "OTHER_TIMESTAMP")
++            addKey("BATTERY_LEVEL", "TIMESTAMP", "BATTERY_INDEX")
++            addKey("HUAWEI_WORKOUT_DATA_SAMPLE", "WORKOUT_ID", "TIMESTAMP")
++            addKey("BASE_ACTIVITY_SUMMARY", "_id")
++            addKey("USER_ATTRIBUTES", "_id")
 +            root.add("unique_keys", keys)
 +
 +            val notes = JsonArray()
@@ -610,13 +669,10 @@ index 096543c..835c1af 100644
 +            LOG.warn("Failed to prune $prefix entries", e)
          }
 +    }
- 
--        LOG.info("Broadcasting database export success={}", success)
++
 +    // ---- helpers -------------------------------------------------------------
  
--        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
--        val exportedNotifyIntent = Intent(action)
--        mContext.sendBroadcast(exportedNotifyIntent)
+-        LOG.info("Broadcasting database export success={}", success)
 +    /** Cursors live in a file: WorkManager runs did not reliably persist them in SharedPreferences. */
 +    private fun cursorFile() = java.io.File(mContext.getExternalFilesDir(null), "export_state.txt")
 +
@@ -628,7 +684,10 @@ index 096543c..835c1af 100644
 +    } catch (e: Exception) {
 +        LOG.warn("Failed to read cursor {}", key, e); 0L
 +    }
-+
+ 
+-        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
+-        val exportedNotifyIntent = Intent(action)
+-        mContext.sendBroadcast(exportedNotifyIntent)
 +    private fun writeCursor(key: String, value: Long) {
 +        try {
 +            val f = cursorFile()
@@ -684,12 +743,12 @@ index 096543c..835c1af 100644
      companion object {
          private val LOG: Logger = LoggerFactory.getLogger(DatabaseExportWorker::class.java)
  
-+        private const val SCHEMA_VERSION = 3
++        private const val SCHEMA_VERSION = 4
 +        private const val KEEP_SNAPSHOTS = 7
 +        private const val FULL_DB_EVERY_MS = 24L * 60 * 60 * 1000
 +        private const val CURSOR_FULL_DB = "last_full_db_ms"
 +        private const val CURSOR_DELTA = "last_delta_sec"
-+        private const val CONSUMER_PACKAGE = "com.example.consumer"
++        private const val CONSUMER_PACKAGE = "com.evolve.mailuo"
 +
 +        /**
 +         * Every table exported incrementally. Columns are discovered at runtime.
@@ -721,6 +780,11 @@ index 096543c..835c1af 100644
              "nodomain.freeyourgadget.gadgetbridge.action.DATABASE_EXPORT_FAIL"
      }
  }
++
++
++
++
++
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FileDownloadService2C.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FileDownloadService2C.java
 index 368bb63..7d9ad9f 100644
@@ -1112,7 +1176,7 @@ index 583c919..871d58f 100644
                          // Nothing to download, go to end
                          fileComplete();
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..131a59a 100644
+index 19582f3..a3a56e1 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -1399,19 +1463,26 @@ index 19582f3..131a59a 100644
      private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
  
      protected ResponseManager responseManager = new ResponseManager(this);
-@@ -817,6 +1080,11 @@ public class HuaweiSupportProvider {
+@@ -817,6 +1080,18 @@ public class HuaweiSupportProvider {
              huaweiDataSyncManager.unregisterAll();
              this.huaweiDataSyncTreeCircleGoals = null;
              stopBatteryRunnerDelayed();
 +            // Local research patch: start beat-to-beat (RRI) collection as soon as we are connected,
 +            // so overnight recording does not depend on a manual sync.
-+            // startRriRepeat();  // 已停用：实时 RRI 保活会持续开 PPG，耗手表电；整晚数据走 sleep_data.bin
++            // Local research patch: re-enable the beat-to-beat stream. It costs battery but it is
++            // the only source of native RR intervals; sleep_data only covers sleep.
++            startRriRepeat();
 +            // Local research patch: pull the full sleep data with a wide window on connect.
 +            enqueueFullSleepDump();
++            // Local research patch: re-apply the health measurement switches on every connect.
++            // Gadgetbridge only pushes these when the settings screen changes something, so a
++            // cleared or half-written preference file would otherwise silently stop the data.
++            pushHealthSwitches();
++            startBusyWatchdog();
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +1884,45 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +1891,45 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
@@ -1457,7 +1528,65 @@ index 19582f3..131a59a 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2832,6 +3139,7 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2538,57 @@ public class HuaweiSupportProvider {
+         }
+     }
+ 
++    /** Clear a stuck busy flag so one failed download cannot block every later sync. */
++    private final android.os.Handler busyWatchdog = new android.os.Handler(android.os.Looper.getMainLooper());
++    private final Runnable busyCheck = new Runnable() {
++        private int stuckMinutes = 0;
++
++        @Override
++        public void run() {
++            try {
++                if (gbDevice != null && gbDevice.isBusy()) {
++                    stuckMinutes++;
++                    LOG.info("BUSY_WATCHDOG task={} minutes={}", gbDevice.getBusyTask(), stuckMinutes);
++                    if (stuckMinutes >= 10) {
++                        LOG.error("BUSY_WATCHDOG clearing stuck task {}", gbDevice.getBusyTask());
++                        gbDevice.unsetBusyTask();
++                        stuckMinutes = 0;
++                    }
++                } else {
++                    stuckMinutes = 0;
++                }
++            } catch (Exception e) {
++                LOG.error("BUSY_WATCHDOG failed", e);
++            }
++            busyWatchdog.postDelayed(this, 60000);
++        }
++    };
++
++    private void startBusyWatchdog() {
++        busyWatchdog.removeCallbacks(busyCheck);
++        busyWatchdog.postDelayed(busyCheck, 60000);
++    }
++    /** Re-apply the health measurement switches that drive data density. */
++    private void pushHealthSwitches() {
++        try {
++            setHeartrateAutomatic();
++            LOG.info("HEALTHSW heart rate automatic pushed");
++        } catch (Exception e) {
++            LOG.error("HEALTHSW heart rate automatic failed", e);
++        }
++        try {
++            setSpoAutomatic();
++            LOG.info("HEALTHSW spo automatic pushed");
++        } catch (Exception e) {
++            LOG.error("HEALTHSW spo automatic failed", e);
++        }
++        try {
++            setSleepBreath();
++            LOG.info("HEALTHSW sleep breath pushed");
++        } catch (Exception e) {
++            LOG.error("HEALTHSW sleep breath failed", e);
++        }
++    }
+     public void setSleepBreath() {
+         if (huaweiDataSyncSleepApnea != null) {
+             boolean sleepBreathSwitch = GBApplication
+@@ -2832,6 +3197,7 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -1465,7 +1594,7 @@ index 19582f3..131a59a 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,9 +3286,10 @@ public class HuaweiSupportProvider {
+@@ -2978,9 +3344,10 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -1478,7 +1607,7 @@ index 19582f3..131a59a 100644
  
          if (downloadDictTrueSleepData(start, end))
              return true;
-@@ -3014,24 +3323,98 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3381,98 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -1582,10 +1711,13 @@ index 19582f3..131a59a 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +3688,26 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +3746,29 @@ public class HuaweiSupportProvider {
      }
  
  }
++
++
++
 +
 +
 +
@@ -2167,4 +2299,3 @@ index 0000000..c7d78ac
 +        android:title="@string/pref_periodic_sync_title" />
 +
 +</PreferenceScreen>
-

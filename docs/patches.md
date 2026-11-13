@@ -94,3 +94,46 @@ app/src/main/java/.../service/devices/huawei/ResponseManager.java               
 app/src/main/res/xml/preferences_periodic_sync.xml                                   新
 ```
 
+
+---
+
+## 2026-11-13 新增（生产必需）
+
+### 连接时重下发健康开关
+
+`HuaweiSupportProvider.pushHealthSwitches()`，在每次连接后调用：
+
+```
+setHeartrateAutomatic()   → 自动心率
+setSpoAutomatic()         → 自动血氧
+setSleepBreath()          → 睡眠呼吸（与呼吸暂停直接相关）
+```
+
+**为什么需要**：Gadgetbridge 只在设置界面被改动时才下发这些开关。
+如果 prefs 被清空或写了一半，数据会静默停止，而且没有任何提示。
+
+日志标记：`HEALTHSW ... pushed`
+
+### 忙碌状态看门狗
+
+`HuaweiSupportProvider.startBusyWatchdog()`，每 60 秒检查一次 `gbDevice.isBusy()`。
+
+一次失败的下载会把 busy 标记永久挂住，之后**所有同步都被
+`Ignoring fetch activity data because we're busy` 挡掉**——实测挂过 2 小时。
+看门狗在连续 10 分钟 busy 后强制 `unsetBusyTask()`。
+
+日志标记：`BUSY_WATCHDOG task=... minutes=...`
+
+### RRI 逐拍数据落盘与导出
+
+`ResponseManager` 把 0x19/0x05 的实时包追加写入 `files/rri/rri_<yyyyMMdd>.csv`：
+
+```
+epoch_s,rri_ms,sqi
+1794561784,745,100
+```
+
+`DatabaseExportWorker.copyRawBlobs()` 增加 `rri/` 目录，导出时复制为 `raw-rri_<date>.csv`。
+
+**关键发现**：RRI **不走文件通道**。`rrisqi_data.bin` 恒为 0 字节，
+数据只在实时流里出现（每次 143 字节）。所以必须自己落盘。
