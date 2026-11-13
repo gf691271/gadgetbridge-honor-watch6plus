@@ -1,0 +1,2170 @@
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/activities/automations/AbstractAutoExportSettingsFragment.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/activities/automations/AbstractAutoExportSettingsFragment.kt
+index 5bb5f45..abfac1a 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/activities/automations/AbstractAutoExportSettingsFragment.kt
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/activities/automations/AbstractAutoExportSettingsFragment.kt
+@@ -75,7 +75,7 @@ abstract class AbstractAutoExportSettingsFragment(
+             }
+             requireContext().contentResolver.takePersistableUriPermission(
+                 uri,
+-                Intent.FLAG_GRANT_WRITE_URI_PERMISSION
++                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION
+             )
+             gbPrefs.preferences.edit {
+                 putString(prefKeyLocation, uri.toString())
+@@ -92,11 +92,22 @@ abstract class AbstractAutoExportSettingsFragment(
+         val prefExportLocation = findPreference<Preference>(prefKeyLocation)
+         if (prefExportLocation != null) {
+             prefExportLocation.setOnPreferenceClickListener {
+-                val i = Intent(Intent.ACTION_CREATE_DOCUMENT)
+-                i.type = exporter.getFileMimeType()
+-                i.addCategory(Intent.CATEGORY_OPENABLE)
+-                i.putExtra(Intent.EXTRA_TITLE, "Gadgetbridge.${exporter.getFileExtension()}")
+-                i.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
++                // Local patch: the database exporter writes timestamped files, so it needs a
++                // directory grant instead of a single-document grant.
++                val i = if (prefKeyLocation == GBPrefs.AUTO_EXPORT_DB_LOCATION) {
++                    Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
++                } else {
++                    Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
++                        type = exporter.getFileMimeType()
++                        addCategory(Intent.CATEGORY_OPENABLE)
++                        putExtra(Intent.EXTRA_TITLE, "Gadgetbridge.${exporter.getFileExtension()}")
++                    }
++                }
++                i.addFlags(
++                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
++                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
++                            Intent.FLAG_GRANT_READ_URI_PERMISSION
++                )
+                 val title: String = requireContext().applicationContext.getString(R.string.choose_auto_export_location)
+                 exportLocationPicker.launch(Intent.createChooser(i, title))
+ 
+@@ -266,3 +277,4 @@ abstract class AbstractAutoExportSettingsFragment(
+         val LOG: Logger = LoggerFactory.getLogger(AbstractAutoExportSettingsFragment::class.java)
+     }
+ }
++
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+index 096543c..835c1af 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+@@ -2,10 +2,17 @@ package nodomain.freeyourgadget.gadgetbridge.database
+ 
+ import android.content.Context
+ import android.content.Intent
++import android.database.Cursor
++import android.net.Uri
++import android.os.Build
++import android.provider.DocumentsContract
+ import androidx.core.content.edit
+ import androidx.core.net.toUri
+ import androidx.work.Worker
+ import androidx.work.WorkerParameters
++import com.google.gson.JsonArray
++import com.google.gson.JsonObject
++import nodomain.freeyourgadget.gadgetbridge.BuildConfig
+ import nodomain.freeyourgadget.gadgetbridge.GBApplication
+ import nodomain.freeyourgadget.gadgetbridge.GBDatabaseManager
+ import nodomain.freeyourgadget.gadgetbridge.R
+@@ -13,71 +20,633 @@ import nodomain.freeyourgadget.gadgetbridge.util.GB
+ import nodomain.freeyourgadget.gadgetbridge.util.GBPrefs
+ import org.slf4j.Logger
+ import org.slf4j.LoggerFactory
++import java.io.OutputStreamWriter
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++import java.util.TimeZone
+ 
++/**
++ * Auto-export worker.
++ *
++ * Writes into the configured directory, never overwriting:
++ *   - one incremental CSV per table (rows added since the previous run, 1h overlap)
++ *   - a manifest JSON with a column dictionary, data-quality stats and dedup rules
++ *   - a full database snapshot daily (keep newest N)
++ *   - every raw .bin the Huawei support produced (whole-night beat-to-beat blobs)
++ *
++ * Columns are discovered from the schema at runtime, so adding a table needs one line.
++ * Local research patch: upstream only overwrites a single fixed file.
++ */
+ class DatabaseExportWorker(
+     private val mContext: Context,
+     workerParams: WorkerParameters
+ ) : Worker(mContext, workerParams) {
++
++    private data class TableSpec(
++        val kind: String,
++        val table: String,
++        val timeColumn: String?,
++        val timeInMs: Boolean = false,
++        val uniqueKey: String = ""
++    )
++
++    private data class ColStat(
++        val name: String,
++        val sqlType: String,
++        val nonNull: Long,
++        val distinct: Long,
++        val min: String?,
++        val max: String?
++    )
++
++    private data class Written(
++        val kind: String,
++        val file: String,
++        val rows: Int,
++        val columns: List<String>,
++        val stats: List<ColStat>,
++        val quality: JsonObject
++    )
++
+     override fun doWork(): Result {
+-        val enabled = GBApplication.getPrefs().getBoolean(GBPrefs.AUTO_EXPORT_DB_ENABLED, false)
+-        if (!enabled) {
++        val prefs = GBApplication.getPrefs()
++        if (!prefs.getBoolean(GBPrefs.AUTO_EXPORT_DB_ENABLED, false)) {
+             LOG.warn("DB export started, but is disabled")
+-            // Should not need i18n, this should never happen
+             GB.updateExportFailedNotification("DB export started, but is disabled", mContext)
+             return Result.failure()
+         }
+ 
+-        val dst = GBApplication.getPrefs().getString(GBPrefs.AUTO_EXPORT_DB_LOCATION, "")
+-
+-        LOG.info("Starting DB export, dst={}", dst)
+-
+-        if (dst == null) {
++        val dst = prefs.getString(GBPrefs.AUTO_EXPORT_DB_LOCATION, "")
++        if (dst.isNullOrEmpty()) {
+             LOG.warn("Unable to export DB, export location not set")
+             GB.updateExportFailedNotification(mContext.getString(R.string.notif_export_location_not_set), mContext)
+             broadcastSuccess(false)
+             return Result.failure()
+         }
+ 
++        val location = dst.toUri()
++        LOG.info("Auto-export run, location={}", location)
++
+         try {
+-            mContext.contentResolver.openOutputStream(dst.toUri()).use { out ->
+-                GBDatabaseManager.exportDB(out)
++            if (!isTree(location)) {
++                mContext.contentResolver.openOutputStream(location).use { out ->
++                    requireNotNull(out) { "no output stream" }
++                    GBDatabaseManager.exportDB(out)
++                }
++                LOG.info("DB export completed (single-file mode)")
++            } else {
++                val nowSec = System.currentTimeMillis() / 1000
++                val lastSec = readCursor(CURSOR_DELTA)
++                val fromSec = if (lastSec == 0L) nowSec - 48 * 3600 else lastSec - 3600
++
++                val written = exportDelta(location, fromSec)
++                val rawCopied = copyRawBlobs(location)
++                writeManifest(location, written, fromSec, nowSec, rawCopied)
++                writeCursor(CURSOR_DELTA, nowSec)
++
++                val lastFull = readCursor(CURSOR_FULL_DB)
++                if (System.currentTimeMillis() - lastFull >= FULL_DB_EVERY_MS) {
++                    exportFullSnapshot(location)
++                    writeCursor(CURSOR_FULL_DB, System.currentTimeMillis())
++                    pruneOld(location, "Gadgetbridge-", ".db", KEEP_SNAPSHOTS)
++                }
++                pruneOld(location, "manifest-", ".json", KEEP_SNAPSHOTS)
++                pruneOld(location, "raw-", ".bin", KEEP_SNAPSHOTS)
+             }
+ 
+-            GBApplication.getPrefs().preferences.edit {
++            prefs.preferences.edit {
+                 putLong(GBPrefs.AUTO_EXPORT_DB_LAST_EXECUTION, System.currentTimeMillis())
+             }
+         } catch (e: Exception) {
+             GB.updateExportFailedNotification(mContext.getString(R.string.notif_export_failed_title), mContext)
+-            LOG.error("Exception while exporting DB", e)
++            LOG.error("Exception while exporting", e)
+             broadcastSuccess(false)
+             return Result.failure()
+         }
+ 
+-        LOG.info("DB export completed")
+-
+         broadcastSuccess(true)
+-
+         return Result.success()
+     }
+ 
+-    private fun broadcastSuccess(success: Boolean) {
+-        if (!GBApplication.getPrefs().getBoolean(GBPrefs.INTENT_API_BROADCAST_EXPORT_DB, false)) {
+-            return
++    // ---- incremental tables --------------------------------------------------
++
++    private fun exportDelta(location: Uri, fromSec: Long): List<Written> {
++        val written = mutableListOf<Written>()
++        GBApplication.acquireDbReadOnly().use { handler ->
++            val db = handler.database
++            for (spec in DELTA_TABLES) {
++                try {
++                    val all = columnsOf(db, spec.table)
++                    if (all.isEmpty()) {
++                        LOG.warn("Table {} not found, skipping", spec.table)
++                        continue
++                    }
++                    // blobs cannot go into a CSV as text; the time column is dropped too,
++                    // because epoch_s already carries it
++                    val usable = all.filter { it.second != "BLOB" && it.first != spec.timeColumn }
++                    val bound = if (spec.timeInMs) fromSec * 1000 else fromSec
++                    val whereSql = if (spec.timeColumn == null) "" else " WHERE ${spec.timeColumn} >= $bound"
++
++                    val stats = columnStats(db, spec, usable, whereSql)
++                    val gaps = mutableListOf<Long>()
++
++                    val name = "${spec.kind}-${stamp()}.csv"
++                    val uri = createDocument(location, name, "text/csv")
++                    var rows = 0
++                    var prevTs = -1L
++
++                    mContext.contentResolver.openOutputStream(uri).use { out ->
++                        requireNotNull(out) { "no output stream for $name" }
++                        val w = OutputStreamWriter(out, Charsets.UTF_8).buffered()
++                        w.write("epoch_s,utc,")
++                        w.write(usable.joinToString(",") { it.first })
++                        w.write("\n")
++
++                        val selectCols = if (spec.timeColumn == null) {
++                            usable.joinToString(",") { it.first }
++                        } else {
++                            usable.joinToString(",") { it.first } + "," + spec.timeColumn
++                        }
++                        val orderBy = if (spec.timeColumn == null) "" else " ORDER BY ${spec.timeColumn}"
++                        db.rawQuery("SELECT $selectCols FROM ${spec.table}$whereSql$orderBy", null).use { c ->
++                            while (c.moveToNext()) {
++                                var ts = System.currentTimeMillis() / 1000
++                                if (spec.timeColumn != null) {
++                                    val raw = c.getLong(usable.size)
++                                    ts = if (spec.timeInMs) raw / 1000 else raw
++                                    if (prevTs >= 0) gaps.add(ts - prevTs)
++                                    prevTs = ts
++                                }
++                                w.write(ts.toString()); w.write(","); w.write(isoUtc(ts)); w.write(",")
++                                for (i in usable.indices) {
++                                    if (i > 0) w.write(",")
++                                    w.write(csvCell(c, i))
++                                }
++                                w.write("\n")
++                                rows++
++                            }
++                        }
++                        w.flush()
++                    }
++
++                    val quality = qualityJson(rows, stats, gaps)
++                    written += Written(spec.kind, name, rows, usable.map { it.first }, stats, quality)
++                    LOG.info("Wrote {} rows x {} cols -> {}", rows, usable.size, name)
++                } catch (e: Exception) {
++                    LOG.error("Failed exporting table {}", spec.table, e)
++                }
++            }
++        }
++        return written
++    }
++
++    private fun columnsOf(db: android.database.sqlite.SQLiteDatabase, table: String): List<Pair<String, String>> {
++        val out = mutableListOf<Pair<String, String>>()
++        try {
++            db.rawQuery("PRAGMA table_info($table)", null).use { c ->
++                while (c.moveToNext()) {
++                    out += c.getString(1) to (c.getString(2) ?: "").uppercase(Locale.US)
++                }
++            }
++        } catch (e: Exception) {
++            LOG.warn("PRAGMA table_info failed for {}", table, e)
++        }
++        return out
++    }
++
++    /** One pass over the table collecting per-column cardinality and range. */
++    private fun columnStats(
++        db: android.database.sqlite.SQLiteDatabase,
++        spec: TableSpec,
++        usable: List<Pair<String, String>>,
++        whereSql: String
++    ): List<ColStat> {
++        if (usable.isEmpty()) return emptyList()
++        val parts = mutableListOf("COUNT(*)")
++        usable.forEach {
++            parts.add("COUNT(${it.first})")
++            parts.add("COUNT(DISTINCT ${it.first})")
++            parts.add("MIN(${it.first})")
++            parts.add("MAX(${it.first})")
++        }
++        val out = mutableListOf<ColStat>()
++        try {
++            db.rawQuery("SELECT ${parts.joinToString(",")} FROM ${spec.table}$whereSql", null).use { c ->
++                if (c.moveToFirst()) {
++                    usable.forEachIndexed { i, col ->
++                        val base = 1 + i * 4
++                        out += ColStat(
++                            col.first, col.second,
++                            c.getLong(base), c.getLong(base + 1),
++                            if (c.isNull(base + 2)) null else c.getString(base + 2),
++                            if (c.isNull(base + 3)) null else c.getString(base + 3)
++                        )
++                    }
++                }
++            }
++        } catch (e: Exception) {
++            LOG.warn("column stats failed for {}", spec.table, e)
++        }
++        return out
++    }
++
++    private fun qualityJson(rows: Int, stats: List<ColStat>, gaps: List<Long>): JsonObject {
++        val q = JsonObject()
++        q.addProperty("rows", rows)
++        if (gaps.isNotEmpty()) {
++            val sorted = gaps.sorted()
++            q.addProperty("interval_median_s", sorted[sorted.size / 2])
++            q.addProperty("interval_max_s", sorted.last())
++            q.addProperty("gap_count_gt_2x_median",
++                gaps.count { it > 2 * sorted[sorted.size / 2] })
++        }
++        val tsStat = stats.firstOrNull { it.sqlType == "INTEGER" }
++        if (tsStat != null && rows > 0) {
++            q.addProperty("distinct_rows_by_first_int_col", tsStat.distinct)
++        }
++        return q
++    }
++
++    private fun csvCell(c: Cursor, index: Int): String {
++        return when (c.getType(index)) {
++            Cursor.FIELD_TYPE_NULL -> ""
++            Cursor.FIELD_TYPE_FLOAT -> c.getDouble(index).toString()
++            Cursor.FIELD_TYPE_INTEGER -> c.getLong(index).toString()
++            Cursor.FIELD_TYPE_BLOB -> ""
++            else -> {
++                val s = c.getString(index) ?: ""
++                if (s.contains(',') || s.contains('"') || s.contains('\n')) {
++                    "\"" + s.replace("\"", "\"\"") + "\""
++                } else s
++            }
++        }
++    }
++
++    // ---- raw blobs -----------------------------------------------------------
++
++    /**
++     * Copies every Huawei raw blob (whole-night beat-to-beat sleep_data, sleep_state, …)
++     * into the export directory. They never reach the database, so without this the
++     * finest data would stay trapped in the app's private folder.
++     */
++    private fun copyRawBlobs(location: Uri): List<String> {
++        val copied = mutableListOf<String>()
++        try {
++            val root = mContext.getExternalFilesDir(null) ?: return copied
++            val existing = existingNames(location)
++            val files = root.walkTopDown()
++                .filter { f ->
++                    f.isFile && f.length() > 0 &&
++                        (f.name.endsWith(".bin") ||
++                            (f.parentFile?.name == "debugdl" && f.name.endsWith(".log")))
++                }
++                .sortedBy { it.name }
++                .toList()
++            for (f in files) {
++                val target = "raw-" + f.name
++                if (existing.contains(target)) continue          // already archived
++                val uri = try {
++                    createDocument(location, target, "application/octet-stream")
++                } catch (e: Exception) {
++                    LOG.warn("createDocument failed for {}", target, e); continue
++                }
++                mContext.contentResolver.openOutputStream(uri).use { out ->
++                    requireNotNull(out) { "no output stream for $target" }
++                    f.inputStream().use { it.copyTo(out) }
++                }
++                copied += target
++            }
++            LOG.info("Archived {} new raw blobs ({} candidates)", copied.size, files.size)
++        } catch (e: Exception) {
++            LOG.error("Failed copying raw blobs", e)
++        }
++        return copied
++    }
++
++    private fun existingNames(location: Uri): Set<String> {
++        val names = mutableSetOf<String>()
++        try {
++            val children = DocumentsContract.buildChildDocumentsUriUsingTree(
++                location, DocumentsContract.getTreeDocumentId(location)
++            )
++            mContext.contentResolver.query(
++                children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
++                null, null, null
++            )?.use { c -> while (c.moveToNext()) names.add(c.getString(0) ?: "") }
++        } catch (e: Exception) {
++            LOG.warn("listing export dir failed", e)
++        }
++        return names
++    }
++
++    // ---- manifest ------------------------------------------------------------
++
++    private fun writeManifest(
++        location: Uri,
++        written: List<Written>,
++        fromSec: Long,
++        toSec: Long,
++        rawCopied: List<String>
++    ) {
++        try {
++            val root = JsonObject()
++            root.addProperty("schema", SCHEMA_VERSION)
++            root.addProperty("exported_at_utc", isoUtc(System.currentTimeMillis() / 1000))
++            root.addProperty("timezone", TimeZone.getDefault().id)
++            root.addProperty("file_name_timezone", TimeZone.getDefault().id)
++            root.addProperty("window_from_epoch_s", fromSec)
++            root.addProperty("window_to_epoch_s", toSec)
++            root.addProperty("row_time_base", "epoch_s (UTC seconds)")
++            root.addProperty("generated_by", "Gadgetbridge database auto-export (local patches)")
++
++            val app = JsonObject()
++            app.addProperty("name", "Gadgetbridge")
++            app.addProperty("version", BuildConfig.VERSION_NAME)
++            app.addProperty("build", "${BuildConfig.FLAVOR} ${BuildConfig.BUILD_TYPE}")
++            root.add("app", app)
++
++            GBApplication.acquireDbReadOnly().use { handler ->
++                val db = handler.database
++                root.add("device", deviceJson(db))
++                root.add("user", userJson(db))
++            }
++
++            val files = JsonArray()
++            for (w in written) {
++                val f = JsonObject()
++                f.addProperty("name", w.file)
++                f.addProperty("kind", w.kind)
++                f.addProperty("rows", w.rows)
++                f.add("data_quality", w.quality)
++                val cols = JsonArray()
++                for (c in w.columns) cols.add(c)
++                f.add("columns", cols)
++                // column dictionary with observed range, so consumers do not have to guess
++                val dict = JsonArray()
++                for (s in w.stats) {
++                    val o = JsonObject()
++                    o.addProperty("name", s.name)
++                    o.addProperty("type", s.sqlType)
++                    o.addProperty("non_null", s.nonNull)
++                    o.addProperty("distinct", s.distinct)
++                    s.min?.let { o.addProperty("min", it) }
++                    s.max?.let { o.addProperty("max", it) }
++                    dict.add(o)
++                }
++                f.add("column_dictionary", dict)
++                files.add(f)
++            }
++            root.add("files", files)
++
++            val raw = JsonArray()
++            rawCopied.forEach { raw.add(it) }
++            root.add("raw_files_new", raw)
++
++            val keys = JsonArray()
++            keys.add("HUAWEI_ACTIVITY_SAMPLE: (TIMESTAMP, OTHER_TIMESTAMP) — plain TIMESTAMP is NOT unique")
++            keys.add("BATTERY_LEVEL: (TIMESTAMP, BATTERY_INDEX)")
++            keys.add("HUAWEI_WORKOUT_DATA_SAMPLE: (WORKOUT_ID, TIMESTAMP)")
++            keys.add("BASE_ACTIVITY_SUMMARY: _id")
++            keys.add("USER_ATTRIBUTES: _id")
++            root.add("unique_keys", keys)
++
++            val notes = JsonArray()
++            notes.add("CSV layout: epoch_s,utc,<original columns>. epoch_s is derived from the table time column.")
++            notes.add("raw_kind: 6=light sleep, 7=deep sleep, 8=REM, 1=steps, -1=unclassified")
++            notes.add("spo: percent, -1 = not measured; roughly every 5 minutes")
++            notes.add("heart_rate / resting_heart_rate: bpm, -1 = not measured")
++            notes.add("nulls: a cell is empty for SQL NULL; -1 is a sentinel meaning 'no data', not a measurement")
++            notes.add("activity rows come in pairs: same TIMESTAMP with OTHER_TIMESTAMP +/-60s — dedup on both")
++            notes.add("file names use local time; timestamps inside files are UTC")
++            notes.add("raw-*.bin are undecoded Huawei blobs (TruSleep format: zero padding + ACC/PPG records)")
++            root.add("notes", notes)
++
++            val name = "manifest-${stamp()}.json"
++            val uri = createDocument(location, name, "application/json")
++            mContext.contentResolver.openOutputStream(uri).use { out ->
++                requireNotNull(out) { "no output stream for $name" }
++                OutputStreamWriter(out, Charsets.UTF_8).buffered().use { w -> w.write(root.toString()) }
++            }
++            LOG.info("Wrote manifest {}", name)
++        } catch (e: Exception) {
++            LOG.error("Failed writing manifest", e)
++        }
++    }
++
++    private fun deviceJson(db: android.database.sqlite.SQLiteDatabase): JsonObject {
++        val o = JsonObject()
++        try {
++            db.rawQuery(
++                "SELECT NAME, MANUFACTURER, MODEL, IDENTIFIER, TYPE_NAME FROM DEVICE LIMIT 1", null
++            ).use { c ->
++                if (c.moveToFirst()) {
++                    o.addProperty("name", c.getString(0))
++                    o.addProperty("manufacturer", c.getString(1))
++                    o.addProperty("model", c.getString(2))
++                    o.addProperty("identifier", c.getString(3))
++                    o.addProperty("type_name", c.getString(4))
++                }
++            }
++            db.rawQuery(
++                "SELECT FIRMWARE_VERSION1, FIRMWARE_VERSION2 FROM DEVICE_ATTRIBUTES ORDER BY _id DESC LIMIT 1", null
++            ).use { c ->
++                if (c.moveToFirst()) {
++                    o.addProperty("firmware", c.getString(0))
++                    val fw2 = c.getString(1)
++                    if (!fw2.isNullOrEmpty()) o.addProperty("firmware2", fw2)
++                }
++            }
++        } catch (e: Exception) {
++            LOG.warn("device metadata unavailable", e)
++        }
++        return o
++    }
++
++    private fun userJson(db: android.database.sqlite.SQLiteDatabase): JsonObject {
++        val o = JsonObject()
++        try {
++            db.rawQuery("SELECT NAME, BIRTHDAY, GENDER FROM USER LIMIT 1", null).use { c ->
++                if (c.moveToFirst()) {
++                    o.addProperty("name", c.getString(0))
++                    o.addProperty("birthday_ms", c.getLong(1))
++                    o.addProperty("gender", c.getInt(2))
++                }
++            }
++            db.rawQuery(
++                "SELECT HEIGHT_CM, WEIGHT_KG, STEPS_GOAL_SPD, SLEEP_GOAL_MPD FROM USER_ATTRIBUTES " +
++                        "ORDER BY (VALID_TO_UTC IS NULL) DESC, _id DESC LIMIT 1", null
++            ).use { c ->
++                if (c.moveToFirst()) {
++                    o.addProperty("height_cm", c.getInt(0))
++                    o.addProperty("weight_kg", c.getInt(1))
++                    if (!c.isNull(2)) o.addProperty("steps_goal", c.getInt(2))
++                    if (!c.isNull(3)) o.addProperty("sleep_goal_min", c.getInt(3))
++                }
++            }
++        } catch (e: Exception) {
++            LOG.warn("user metadata unavailable", e)
++        }
++        return o
++    }
++
++    // ---- full snapshot -------------------------------------------------------
++
++    private fun exportFullSnapshot(location: Uri) {
++        val name = "Gadgetbridge-${stamp()}.db"
++        val uri = createDocument(location, name, "application/octet-stream")
++        mContext.contentResolver.openOutputStream(uri).use { out ->
++            requireNotNull(out) { "no output stream for $name" }
++            GBDatabaseManager.exportDB(out)
++        }
++        LOG.info("Full DB snapshot written: {}", name)
++    }
++
++    private fun pruneOld(location: Uri, prefix: String, suffix: String, keep: Int) {
++        try {
++            val children = DocumentsContract.buildChildDocumentsUriUsingTree(
++                location, DocumentsContract.getTreeDocumentId(location)
++            )
++            data class Entry(val uri: Uri, val name: String, val modified: Long)
++
++            val entries = mutableListOf<Entry>()
++            mContext.contentResolver.query(
++                children,
++                arrayOf(
++                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
++                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
++                    DocumentsContract.Document.COLUMN_LAST_MODIFIED
++                ),
++                null, null, null
++            )?.use { c ->
++                while (c.moveToNext()) {
++                    val name = c.getString(1) ?: continue
++                    if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue
++                    val id = c.getString(0) ?: continue
++                    entries += Entry(
++                        DocumentsContract.buildDocumentUriUsingTree(location, id),
++                        name,
++                        c.getLong(2)
++                    )
++                }
++            }
++            entries.sortedByDescending { it.modified }.drop(keep).forEach {
++                try {
++                    DocumentsContract.deleteDocument(mContext.contentResolver, it.uri)
++                    LOG.info("Pruned {}", it.name)
++                } catch (e: Exception) {
++                    LOG.warn("Failed to prune {}", it.name, e)
++                }
++            }
++        } catch (e: Exception) {
++            LOG.warn("Failed to prune $prefix entries", e)
+         }
++    }
+ 
+-        LOG.info("Broadcasting database export success={}", success)
++    // ---- helpers -------------------------------------------------------------
+ 
+-        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
+-        val exportedNotifyIntent = Intent(action)
+-        mContext.sendBroadcast(exportedNotifyIntent)
++    /** Cursors live in a file: WorkManager runs did not reliably persist them in SharedPreferences. */
++    private fun cursorFile() = java.io.File(mContext.getExternalFilesDir(null), "export_state.txt")
++
++    private fun readCursor(key: String): Long = try {
++        val f = cursorFile()
++        if (!f.exists()) 0L
++        else f.readLines().firstOrNull { it.startsWith("$key=") }
++            ?.substringAfter('=')?.trim()?.toLongOrNull() ?: 0L
++    } catch (e: Exception) {
++        LOG.warn("Failed to read cursor {}", key, e); 0L
++    }
++
++    private fun writeCursor(key: String, value: Long) {
++        try {
++            val f = cursorFile()
++            val map = LinkedHashMap<String, String>()
++            if (f.exists()) {
++                f.readLines().forEach { line ->
++                    val k = line.substringBefore('=', "")
++                    if (k.isNotEmpty() && k != key) map[k] = line.substringAfter('=')
++                }
++            }
++            map[key] = value.toString()
++            f.writeText(map.entries.joinToString("\n") { "${it.key}=${it.value}" })
++        } catch (e: Exception) {
++            LOG.warn("Failed to write cursor {}", key, e)
++        }
++    }
++
++    private fun stamp(): String = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
++
++    private fun isoUtc(epochSec: Long): String =
++        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
++            timeZone = TimeZone.getTimeZone("UTC")
++        }.format(Date(epochSec * 1000))
++
++    private fun isTree(uri: Uri): Boolean =
++        Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && DocumentsContract.isTreeUri(uri)
++
++    private fun createDocument(location: Uri, name: String, mime: String): Uri {
++        val parent = DocumentsContract.buildDocumentUriUsingTree(
++            location, DocumentsContract.getTreeDocumentId(location)
++        )
++        return DocumentsContract.createDocument(mContext.contentResolver, parent, mime, name)
++            ?: throw IllegalStateException("createDocument returned null for $name")
++    }
++
++    /**
++     * Announces the export so consumers do not have to poll the directory.
++     * Sent explicitly to the companion app when it is installed, and as a normal
++     * broadcast otherwise (dynamically registered receivers still get it).
++     */
++    private fun broadcastSuccess(success: Boolean) {
++        val action = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
++        try {
++            mContext.sendBroadcast(Intent(action))
++            val explicit = Intent(action).setPackage(CONSUMER_PACKAGE)
++            mContext.sendBroadcast(explicit)
++            LOG.info("Broadcast {} (also to {})", action, CONSUMER_PACKAGE)
++        } catch (e: Exception) {
++            LOG.warn("Broadcast failed", e)
++        }
+     }
+ 
+     companion object {
+         private val LOG: Logger = LoggerFactory.getLogger(DatabaseExportWorker::class.java)
+ 
++        private const val SCHEMA_VERSION = 3
++        private const val KEEP_SNAPSHOTS = 7
++        private const val FULL_DB_EVERY_MS = 24L * 60 * 60 * 1000
++        private const val CURSOR_FULL_DB = "last_full_db_ms"
++        private const val CURSOR_DELTA = "last_delta_sec"
++        private const val CONSUMER_PACKAGE = "com.example.consumer"
++
++        /**
++         * Every table exported incrementally. Columns are discovered at runtime.
++         * timeColumn = null means the table has no timestamp: it is exported whole each run.
++         */
++        private val DELTA_TABLES = listOf(
++            TableSpec("activity", "HUAWEI_ACTIVITY_SAMPLE", "TIMESTAMP",
++                uniqueKey = "TIMESTAMP+OTHER_TIMESTAMP"),
++            TableSpec("battery", "BATTERY_LEVEL", "TIMESTAMP", uniqueKey = "TIMESTAMP+BATTERY_INDEX"),
++            TableSpec("workout-sample", "HUAWEI_WORKOUT_DATA_SAMPLE", "TIMESTAMP",
++                uniqueKey = "WORKOUT_ID+TIMESTAMP"),
++            TableSpec("workout-summary", "HUAWEI_WORKOUT_SUMMARY_SAMPLE", "START_TIMESTAMP",
++                uniqueKey = "_id"),
++            // START_TIME is in epoch milliseconds, unlike the sample tables
++            TableSpec("workout-base", "BASE_ACTIVITY_SUMMARY", "START_TIME", timeInMs = true,
++                uniqueKey = "_id"),
++            // user body metrics history (height/weight changes over time)
++            TableSpec("user-attributes", "USER_ATTRIBUTES", "VALID_FROM_UTC", timeInMs = true,
++                uniqueKey = "_id"),
++            // no timestamp column at all: exported whole, every run
++            TableSpec("workout-pace", "HUAWEI_WORKOUT_PACE_SAMPLE", null, uniqueKey = "WORKOUT_ID+POINT_INDEX"),
++            TableSpec("device-attributes", "DEVICE_ATTRIBUTES", "VALID_FROM_UTC", timeInMs = true,
++                uniqueKey = "_id"),
++        )
++
+         const val ACTION_DATABASE_EXPORT_SUCCESS: String =
+             "nodomain.freeyourgadget.gadgetbridge.action.DATABASE_EXPORT_SUCCESS"
+         const val ACTION_DATABASE_EXPORT_FAIL: String =
+             "nodomain.freeyourgadget.gadgetbridge.action.DATABASE_EXPORT_FAIL"
+     }
+ }
++
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FileDownloadService2C.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FileDownloadService2C.java
+index 368bb63..7d9ad9f 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FileDownloadService2C.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FileDownloadService2C.java
+@@ -31,39 +31,47 @@ public class FileDownloadService2C {
+     public static final int id = 0x2c;
+ 
+     public enum FileType {
+-        SLEEP_STATE,
+-        SLEEP_DATA,
+-        RRI,
+-        GPS,
+-        PDR,
+-        SEQUENCE_DATA,
+-        ECG_ANALYSIS_DATA,
+-        UNKNOWN; // Never use this as input
+-
+-        static byte fileTypeToByte(FileType fileType) {
+-            return switch (fileType) {
+-                case SLEEP_STATE -> (byte) 0x0e;
+-                case SLEEP_DATA -> (byte) 0x0f;
+-                case RRI -> (byte) 0x10;
+-                case GPS -> (byte) 0x11;
+-                case PDR -> (byte)0x12;
+-                case SEQUENCE_DATA -> (byte) 0x16;
+-                case ECG_ANALYSIS_DATA -> (byte) 0x18;
+-                default -> throw new RuntimeException();
+-            };
++        SLEEP_STATE(0x0e),
++        SLEEP_DATA(0x0f),
++        RRI(0x10),
++        GPS(0x11),
++        PDR(0x12),
++        SEQUENCE_DATA(0x16),
++        ECG_ANALYSIS_DATA(0x18),
++        // Local patch: remaining file ids observed in com.hihonor.health
++        ATRIAL(0x02),
++        RRI_DATA(0x03),
++        ONCE_RRI(0x04),
++        OSA_RRI(0x05),
++        OSA_SPO2(0x06),
++        RRI_DRAW(0x07),
++        ECG(0x08),
++        ONCE_PPG(0x09),
++        FOOD(0x13),
++        ARRHY(0x14),
++        BP_RESULT(0x17),
++        WORKOUT(0x19),
++        CARDIAC_ARREST(0x1b),
++        UNKNOWN(-1); // Never use this as input
++
++        public final byte value;
++
++        FileType(int value) {
++            this.value = (byte) value;
+         }
+ 
+-        static FileType byteToFileType(byte b) {
+-            return switch (b) {
+-                case 0x0e -> FileType.SLEEP_STATE;
+-                case 0x0f -> FileType.SLEEP_DATA;
+-                case 0x10 -> FileType.RRI;
+-                case 0x11 -> FileType.GPS;
+-                case 0x12 -> FileType.PDR;
+-                case 0x16 -> FileType.SEQUENCE_DATA;
+-                case 0x18 -> FileType.ECG_ANALYSIS_DATA;
+-                default -> FileType.UNKNOWN;
+-            };
++        public static byte fileTypeToByte(FileType fileType) {
++            if (fileType == null || fileType == UNKNOWN)
++                throw new RuntimeException("Unsupported file type");
++            return fileType.value;
++        }
++
++        public static FileType byteToFileType(byte b) {
++            for (FileType t : values()) {
++                if (t != UNKNOWN && t.value == b)
++                    return t;
++            }
++            return FileType.UNKNOWN;
+         }
+     }
+ 
+@@ -92,6 +100,22 @@ public class FileDownloadService2C {
+ 
+                 this.complete = true;
+             }
++
++            /** Local patch: send an arbitrary type byte, used to probe unknown file ids. */
++            public Request(ParamsProvider paramsProvider, String filename, byte rawFileId, int startTime, int endTime) {
++                super(paramsProvider);
++
++                this.serviceId = FileDownloadService2C.id;
++                this.commandId = id;
++
++                this.tlv = new HuaweiTLV()
++                        .put(0x01, filename)
++                        .put(0x02, rawFileId)
++                        .put(0x05, startTime)
++                        .put(0x06, endTime);
++
++                this.complete = true;
++            }
+         }
+ 
+         public static class Response extends HuaweiPacket {
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/Workout.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/Workout.java
+index 3e715d7..7f26316 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/Workout.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/Workout.java
+@@ -649,9 +649,20 @@ public class Workout {
+                         }
+                     }
+                 }
++                int perRecordLength = dataLength;
+                 dataLength = dataLength * header.dataCount;
+-                if (dataLength != this.rawData.length)
+-                    throw new LengthMismatchException("Workout data length mismatch with bitmap.");
++                // Newer firmware appends fields that bitmapLengths does not know about.
++                // Tolerate a small per-record surplus instead of dropping the whole workout.
++                int extraPerRecord = 0;
++                if (dataLength != this.rawData.length) {
++                    int actualPerRecord = header.dataCount > 0 ? this.rawData.length / header.dataCount : 0;
++                    int extra = actualPerRecord - perRecordLength;
++                    if (header.dataCount <= 0
++                            || this.rawData.length % header.dataCount != 0
++                            || extra < 0 || extra > 64)
++                        throw new LengthMismatchException("Workout data length mismatch with bitmap.");
++                    extraPerRecord = extra;
++                }
+ 
+                 this.dataList = new ArrayList<>();
+                 buf = ByteBuffer.wrap(this.rawData);
+@@ -705,6 +716,11 @@ public class Workout {
+                             }
+                         }
+                     }
++                    // Skip the firmware's extra trailing fields for this record.
++                    if (extraPerRecord > 0) {
++                        int skip = Math.min(extraPerRecord, buf.remaining());
++                        buf.position(buf.position() + skip);
++                    }
+                     this.dataList.add(data);
+                 }
+             }
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/PeriodicSyncReceiver.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/PeriodicSyncReceiver.java
+new file mode 100644
+index 0000000..2cdee5b
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/PeriodicSyncReceiver.java
+@@ -0,0 +1,39 @@
++/*  Local research patch (not upstream): wake up periodically and pull recorded data
++    from the watch, so daily collection no longer needs a manual tap. */
++package nodomain.freeyourgadget.gadgetbridge.externalevents;
++
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import nodomain.freeyourgadget.gadgetbridge.GBApplication;
++import nodomain.freeyourgadget.gadgetbridge.model.DeviceService;
++import nodomain.freeyourgadget.gadgetbridge.model.RecordedDataTypes;
++
++public class PeriodicSyncReceiver extends BroadcastReceiver {
++    private static final Logger LOG = LoggerFactory.getLogger(PeriodicSyncReceiver.class);
++
++    public static final String ACTION = "nodomain.freeyourgadget.gadgetbridge.PERIODIC_SYNC";
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++        LOG.info("PERIODIC_SYNC fired");
++        try {
++            DeviceService service = GBApplication.deviceService();
++            if (service == null) {
++                LOG.warn("PERIODIC_SYNC skipped: no device service");
++            } else {
++                service.connect();
++                service.onFetchRecordedData(RecordedDataTypes.TYPE_SYNC);
++                LOG.info("PERIODIC_SYNC requested TYPE_SYNC");
++            }
++        } catch (Exception e) {
++            LOG.error("PERIODIC_SYNC failed", e);
++        }
++        // chain the next run; an alarm that fired once is not rescheduled by itself
++        PeriodicSyncScheduler.scheduleNext(context);
++    }
++}
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/PeriodicSyncScheduler.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/PeriodicSyncScheduler.java
+new file mode 100644
+index 0000000..be92ff0
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/PeriodicSyncScheduler.java
+@@ -0,0 +1,121 @@
++/*  Local research patch (not upstream): schedule a periodic watch sync.
++
++    The interval is user-configurable via Settings -> 通用 -> 定时同步
++    (key: pref_periodic_sync_interval, values 0/6/12/24 hours).
++    Runs are aligned to 08:00 local time, so with 6h you get 08/14/20/02
++    instead of an arbitrary "now + 6h". */
++package nodomain.freeyourgadget.gadgetbridge.externalevents;
++
++import android.app.AlarmManager;
++import android.app.PendingIntent;
++import android.content.Context;
++import android.content.Intent;
++import android.os.Build;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.Calendar;
++
++import nodomain.freeyourgadget.gadgetbridge.GBApplication;
++
++public final class PeriodicSyncScheduler {
++    private static final Logger LOG = LoggerFactory.getLogger(PeriodicSyncScheduler.class);
++
++    public static final String PREF_KEY = "pref_periodic_sync_interval";
++    private static final int DEFAULT_HOURS = 6;
++    /** All runs are anchored to this local hour. */
++    private static final int ANCHOR_HOUR = 8;
++    private static final int REQUEST_CODE = 4711;
++
++    private PeriodicSyncScheduler() {
++    }
++
++    /** Configured interval in ms, or 0 when disabled. */
++    public static long intervalMs(Context context) {
++        int hours = DEFAULT_HOURS;
++        try {
++            String raw = GBApplication.getPrefs().getString(PREF_KEY, String.valueOf(DEFAULT_HOURS));
++            hours = Integer.parseInt(raw);
++        } catch (Exception e) {
++            LOG.warn("PERIODIC_SYNC bad interval preference, using default", e);
++        }
++        if (hours <= 0 || hours > 24) {
++            return 0;
++        }
++        return hours * 60L * 60L * 1000L;
++    }
++
++    /** Next fire time: first anchor-aligned slot strictly after now. */
++    static long nextFireTime(long now, long interval) {
++        Calendar anchor = Calendar.getInstance();
++        anchor.setTimeInMillis(now);
++        anchor.set(Calendar.HOUR_OF_DAY, ANCHOR_HOUR);
++        anchor.set(Calendar.MINUTE, 0);
++        anchor.set(Calendar.SECOND, 0);
++        anchor.set(Calendar.MILLISECOND, 0);
++        long anchorMs = anchor.getTimeInMillis();
++        // Slots repeat every `interval` around the anchor, including *before* it
++        // (08:00, 14:00, 20:00, 02:00). Use floor division so a time between
++        // midnight and the anchor still lands on the correct early-morning slot.
++        long k = Math.floorDiv(now - anchorMs, interval) + 1;
++        return anchorMs + k * interval;
++    }
++
++    public static void cancel(Context context) {
++        try {
++            AlarmManager am = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
++            if (am != null) {
++                am.cancel(buildPendingIntent(context));
++            }
++            LOG.info("PERIODIC_SYNC cancelled");
++        } catch (Exception e) {
++            LOG.error("PERIODIC_SYNC cancel failed", e);
++        }
++    }
++
++    private static PendingIntent buildPendingIntent(Context context) {
++        Intent intent = new Intent(context, PeriodicSyncReceiver.class)
++                .setAction(PeriodicSyncReceiver.ACTION);
++        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++            flags |= PendingIntent.FLAG_IMMUTABLE;
++        }
++        return PendingIntent.getBroadcast(context, REQUEST_CODE, intent, flags);
++    }
++
++    /** Arm the next run according to the preference. Safe to call repeatedly. */
++    public static void scheduleNext(Context context) {
++        try {
++            long interval = intervalMs(context);
++            if (interval <= 0) {
++                cancel(context);
++                return;
++            }
++            AlarmManager am = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
++            if (am == null) {
++                LOG.warn("PERIODIC_SYNC scheduler: no AlarmManager");
++                return;
++            }
++            PendingIntent pi = buildPendingIntent(context);
++            long at = nextFireTime(System.currentTimeMillis(), interval);
++
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
++            } else {
++                am.set(AlarmManager.RTC_WAKEUP, at, pi);
++            }
++            long inMin = (at - System.currentTimeMillis()) / 60000;
++            LOG.info("PERIODIC_SYNC scheduled at {} (in {} min, interval {} min)",
++                    new java.util.Date(at), inMin, interval / 60000);
++        } catch (Exception e) {
++            LOG.error("PERIODIC_SYNC scheduling failed", e);
++        }
++    }
++
++    /** Called once at application start and whenever the preference changes. */
++    public static void start(Context context) {
++        scheduleNext(context);
++    }
++}
++
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiFileDownloadManager.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiFileDownloadManager.java
+index 583c919..871d58f 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiFileDownloadManager.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiFileDownloadManager.java
+@@ -118,15 +118,35 @@ public class HuaweiFileDownloadManager {
+     }
+ 
+     public enum FileType {
+-        DEBUG,
+-        SLEEP_STATE,
+-        SLEEP_DATA,
+-        RRI,
+-        GPS,
+-        PDR,
+-        SEQUENCE_DATA,
+-        ECG_ANALYSIS_DATA,
+-        UNKNOWN // Never for input!
++        DEBUG(0x00),
++        SLEEP_STATE(0x0e),
++        SLEEP_DATA(0x0f),
++        RRI(0x10),
++        GPS(0x11),
++        PDR(0x12),
++        SEQUENCE_DATA(0x16),
++        ECG_ANALYSIS_DATA(0x18),
++        // Local patch: remaining file ids observed in com.hihonor.health
++        ATRIAL(0x02),
++        RRI_DATA(0x03),
++        ONCE_RRI(0x04),
++        OSA_RRI(0x05),
++        OSA_SPO2(0x06),
++        RRI_DRAW(0x07),
++        ECG(0x08),
++        ONCE_PPG(0x09),
++        FOOD(0x13),
++        ARRHY(0x14),
++        BP_RESULT(0x17),
++        WORKOUT(0x19),
++        CARDIAC_ARREST(0x1b),
++        UNKNOWN(-1); // Never for input!
++
++        public final byte value;
++
++        FileType(int value) {
++            this.value = (byte) value;
++        }
+     }
+ 
+     public static class FileDownloadCallback {
+@@ -176,6 +196,11 @@ public class HuaweiFileDownloadManager {
+             return new FileRequest(filename, FileType.UNKNOWN, true, fileDownloadCallback);
+         }
+ 
++        /** Local research patch: request any file id by name + type byte (new sync protocol). */
++        public static FileRequest customFileRequest(String filename, FileType fileType, int startTime, int endTime, FileDownloadCallback fileDownloadCallback) {
++            return new FileRequest(filename, fileType, true, startTime, endTime, fileDownloadCallback);
++        }
++
+         public static FileRequest sleepStateFileRequest(boolean supportsTruSleepNewSync, int startTime, int endTime, FileDownloadCallback fileDownloadCallback) {
+             return new FileRequest("sleep_state.bin", FileType.SLEEP_STATE, supportsTruSleepNewSync, startTime, endTime, fileDownloadCallback);
+         }
+@@ -587,6 +612,10 @@ public class HuaweiFileDownloadManager {
+                     }
+                     currentFileRequest.fileId = r.fileId;
+                     currentFileRequest.fileSize = r.fileSize;
++                    // Local patch: expose what the device reports, so an empty file can be
++                    // distinguished from a mis-parsed or unsupported request.
++                    LOG.info("FILEDL_INIT name={} id={} size={}",
++                            currentFileRequest.getFilename(), r.fileId, r.fileSize);
+                     if (r.fileSize == 0) {
+                         // Nothing to download, go to end
+                         fileComplete();
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index 19582f3..131a59a 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -42,6 +42,7 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import java.io.File;
++import java.io.FileOutputStream;
+ import java.nio.charset.StandardCharsets;
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -169,6 +170,7 @@ import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.Send
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendExtendedAccountRequest;
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFitnessUserInfoRequest;
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGetDefaultSwitch;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHROpenCloseRequest;
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGpsDataRequest;
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFileUploadInfo;
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHeartRateZonesConfig;
+@@ -281,6 +283,267 @@ public class HuaweiSupportProvider {
+     private boolean gpsEnabled = false;
+     private Location gpsLastLocation;
+ 
++    /** Local research patch: whether the beat-to-beat (RRI) stream was opened this session. */
++    private boolean rriStreamOpened = false;
++    private final android.os.Handler rriHandler = new android.os.Handler(android.os.Looper.getMainLooper());
++    private final Runnable rriRepeat = new Runnable() {
++        @Override
++        public void run() {
++            openRriStream();
++            rriHandler.postDelayed(this, 15000);
++        }
++    };
++
++    /** Send the "open beat-to-beat measurement" command (0x19/0x01, type 3). */
++    private void openRriStream() {
++        try {
++            new SendHROpenCloseRequest(this, (byte) 3).doPerform();
++            rriStreamOpened = true;
++            LOG.info("RRI_STREAM_OPEN requested");
++        } catch (Exception e) {
++            LOG.error("RRI stream open failed", e);
++        }
++    }
++
++    /** Files worth pulling from the 0x0A debug list (raw biometric + audio + gait). */
++    private static final String[] DEBUG_DL_CANDIDATES = {
++            "beat_raw_scisports.log", "beat_raw_dataa.log", "beat_raw_datab.log", "beat_raw_ecg.log",
++            "audio0.log", "audio1.log", "audio2.log",
++            "gps.bin", "pdr.bin"
++            // NOTE: the real data files (rrisqi/sleep_state/sleep_data) were removed on
++            // purpose. The watch hands each file out exactly once and then returns size 0,
++            // so probing them here consumed the data before enqueueFullSleepDump could
++            // archive it. Only the dump path may request them now.
++    };
++
++    /** Services reported by the device but absent from Gadgetbridge: send their first command. */
++    private static final int[][] UNKNOWN_SERVICES = {
++            {0x16, 0x01}, {0x1B, 0x01}, {0x2E, 0x01}, {0x30, 0x01}, {0x35, 0x03}
++    };
++
++    private void probeUnknownServices() {
++        for (int[] svc : UNKNOWN_SERVICES) {
++            try {
++                new nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                        .SendUnknownServiceProbeRequest(this, svc[0], svc[1]).doPerform();
++                LOG.info("UNKSVC requested 0x{} cmd 0x{}", Integer.toHexString(svc[0]), Integer.toHexString(svc[1]));
++            } catch (Exception e) {
++                LOG.info("UNKSVC failed 0x{}: {}", Integer.toHexString(svc[0]), e.getMessage());
++            }
++        }
++    }
++    /** Ask 0x0A for the first block of sleep_data.bin (known to be 78052 bytes via 0x2C). */
++    private void probeBlockRead() {
++        try {
++            new nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                    .SendFileParametersProbe(this).doPerform();
++            new nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                    .SendBlockProbeRequest(this, "sleep_data.bin", 0, 4096).doPerform();
++            LOG.info("BLOCKPROBE requested sleep_data.bin offset=0 size=4096");
++        } catch (Exception e) {
++            LOG.error("BLOCKPROBE failed", e);
++        }
++    }
++    /** Ask 0x0A for the sleep and rri file lists (they may differ from the debug list). */
++    private void probeListCategories() {
++        int end = (int) (System.currentTimeMillis() / 1000L);
++        int start = end - 7 * 24 * 3600;
++        for (String cat : new String[]{"SLEEP", "RRI"}) {
++            try {
++                new nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                        .SendListCategoryProbeRequest(this,
++                        nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                                .SendListCategoryProbeRequest.Category.valueOf(cat),
++                        start, end).doPerform();
++                LOG.info("LISTCAT requested {}", cat);
++            } catch (Exception e) {
++                LOG.error("LISTCAT failed {}", cat, e);
++            }
++        }
++    }
++    /** Ask 0x0A FileInfo for each candidate: proves existence and reports the size. */
++    private void probeFileInfo() {
++        // documented 0x0A flow: init -> FileParameters -> FileInfo
++        try {
++            new nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                    .SendFileParametersProbe(this).doPerform();
++            LOG.info("FILEINFO parameters sent");
++        } catch (Exception e) {
++            LOG.error("FILEINFO parameters failed", e);
++        }
++        for (String name : DEBUG_DL_CANDIDATES) {
++            try {
++                new nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                        .SendFileInfoProbeRequest(this, name).doPerform();
++                LOG.info("FILEINFO requested {}", name);
++            } catch (Exception e) {
++                LOG.error("FILEINFO failed {}", name, e);
++            }
++        }
++    }
++    /** Try to download each candidate through service 0x0A and keep the small ones. */
++    private void probeDebugDownloads() {
++        for (final String name : DEBUG_DL_CANDIDATES) {
++            try {
++                huaweiFileDownloadManager.addToQueue(
++                        HuaweiFileDownloadManager.FileRequest.debugFileRequest(name,
++                                new HuaweiFileDownloadManager.FileDownloadCallback() {
++                                    @Override
++                                    public void downloadComplete(HuaweiFileDownloadManager.FileRequest fr, @Nullable File raw) {
++                                        byte[] d = fr.getData();
++                                        int len = d == null ? -1 : d.length;
++                                        LOG.info("DEBUGDL {} bytes={}", name, len);
++                                        if (d != null && len > 0 && len <= 16 * 1024 * 1024) {
++                                            try {
++                                                File dir = new File(getContext().getExternalFilesDir(null), "debugdl");
++                                                if (!dir.exists()) dir.mkdirs();
++                                                File out = new File(dir, name);
++                                                try (FileOutputStream fos = new FileOutputStream(out)) {
++                                                    fos.write(d);
++                                                }
++                                            } catch (Exception e) {
++                                                LOG.error("DEBUGDL save failed {}", name, e);
++                                            }
++                                        }
++                                    }
++
++                                    @Override
++                                    public void downloadException(HuaweiFileDownloadManager.HuaweiFileDownloadException e) {
++                                        LOG.info("DEBUGDL {} failed: {}", name, e.getMessage());
++                                    }
++                                }), false);
++            } catch (Exception e) {
++                LOG.error("DEBUGDL enqueue failed {}", name, e);
++            }
++        }
++    }
++    /** Request one sleep_data download for a specific window (experiment helper). */
++    private void enqueueSleepDump(int start, int end, final int hours) {
++        try {
++            huaweiFileDownloadManager.addToQueue(
++                    HuaweiFileDownloadManager.FileRequest.sleepDataFileRequest(
++                            getDeviceState().getSupportsTruSleepNewSync(), start, end,
++                            new HuaweiFileDownloadManager.FileDownloadCallback() {
++                                @Override
++                                public void downloadComplete(HuaweiFileDownloadManager.FileRequest fr, @Nullable File raw) {
++                                    byte[] d = fr.getData();
++                                    int len = d == null ? -1 : d.length;
++                                    String hash = "-";
++                                    if (d != null && len > 0) {
++                                        try {
++                                            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
++                                            byte[] dig = md.digest(d);
++                                            StringBuilder sb = new StringBuilder();
++                                            for (int i = 0; i < 8; i++) sb.append(String.format("%02x", dig[i]));
++                                            hash = sb.toString();
++                                        } catch (Exception ignored) {
++                                        }
++                                    }
++                                    LOG.info("WINDOWTEST hours={} bytes={} sha={}", hours, len, hash);
++                                }
++
++                                @Override
++                                public void downloadException(HuaweiFileDownloadManager.HuaweiFileDownloadException e) {
++                                    LOG.info("WINDOWTEST hours={} failed: {}", hours, e.getMessage());
++                                }
++                            }), false);
++            LOG.info("WINDOWTEST queued hours={}", hours);
++        } catch (Exception e) {
++            LOG.error("WINDOWTEST enqueue failed {}", hours, e);
++        }
++    }
++    /** Start re-opening the RRI stream every 15s (the device closes it on its own). */
++    private void startRriRepeat() {
++        rriHandler.removeCallbacks(rriRepeat);
++        rriHandler.postDelayed(rriRepeat, 15000);
++        LOG.info("RRI_STREAM_REPEAT started");
++    }
++
++    /**
++     * Local research patch: request sleep data with a 48h window.
++     * Gadgetbridge's own path uses "since last sync" (~1.5h here), which makes the device
++     * answer with size=0, while a 48h window returns the full backlog (~78 KB).
++     */
++    private void enqueueFullSleepDump() {
++        int end = (int) (System.currentTimeMillis() / 1000L);
++        int start = end - 48 * 3600;
++        huaweiFileDownloadManager.addToQueue(
++                HuaweiFileDownloadManager.FileRequest.customFileRequest(
++                        "sleep_data.bin",
++                        HuaweiFileDownloadManager.FileType.SLEEP_DATA,
++                        start,
++                        end,
++                        new HuaweiFileDownloadManager.FileDownloadCallback() {
++                            @Override
++                            public void downloadComplete(HuaweiFileDownloadManager.FileRequest fr, @Nullable File raw) {
++                                byte[] data = fr.getData();
++                                LOG.info("FULLDUMP sleep_data bytes={}", data.length);
++                                try {
++                                    java.io.File dir = new java.io.File(
++                                            getContext().getExternalFilesDir(null), "dump");
++                                    if (!dir.exists()) dir.mkdirs();
++                                    java.io.File out = new java.io.File(dir, "sleep_data_"
++                                            + System.currentTimeMillis() + ".bin");
++                                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
++                                        fos.write(data);
++                                    }
++                                    LOG.info("FULLDUMP saved {}", out.getAbsolutePath());
++                                } catch (Exception e) {
++                                    LOG.error("FULLDUMP save failed", e);
++                                }
++                            }
++
++                            @Override
++                            public void downloadException(HuaweiFileDownloadManager.HuaweiFileDownloadException e) {
++                                LOG.info("FULLDUMP sleep_data failed: {}", e.getMessage());
++                            }
++                        }), false);
++        LOG.info("FULLDUMP requested {} -> {}", start, end);
++    }
++
++    // ---- Local research patch: brute-force file-type ids ----------------------
++    private final android.os.Handler probeHandler = new android.os.Handler(android.os.Looper.getMainLooper());
++    private int probeType = 0;
++    private int probeNameIdx = 0;
++
++    /** Candidate filenames seen in com.hihonor.health that were never tried. */
++    private static final String[] PROBE_NAMES = {
++            "sleep_state.bin"
++    };
++
++    private final Runnable probeStep = new Runnable() {
++        @Override
++        public void run() {
++            if (probeNameIdx >= PROBE_NAMES.length) {
++                LOG.info("PROBE_NAME done");
++                return;
++            }
++            String name = PROBE_NAMES[probeNameIdx];
++            int end = (int) (System.currentTimeMillis() / 1000L);
++            try {
++                new nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendRawFileProbeRequest(
++                        HuaweiSupportProvider.this, name, (byte) probeType, end - 172800, end).doPerform();
++            } catch (Exception e) {
++                LOG.error("PROBE_NAME {} type={} failed", name, probeType, e);
++            }
++            probeType++;
++            if (probeType > 0xFF) {
++                probeType = 0;
++                probeNameIdx++;
++            }
++            probeHandler.postDelayed(this, 120);
++        }
++    };
++
++    /** Probe 16 candidate filenames against type bytes 0x00-0x2F. */
++    private void startTypeProbe() {
++        probeType = 0;
++        probeNameIdx = 0;
++        probeHandler.removeCallbacks(probeStep);
++        probeHandler.post(probeStep);
++        LOG.info("PROBE_NAME started names={} types=0x00-0xFF", PROBE_NAMES.length);
++    }
++
+     private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
+ 
+     protected ResponseManager responseManager = new ResponseManager(this);
+@@ -817,6 +1080,11 @@ public class HuaweiSupportProvider {
+             huaweiDataSyncManager.unregisterAll();
+             this.huaweiDataSyncTreeCircleGoals = null;
+             stopBatteryRunnerDelayed();
++            // Local research patch: start beat-to-beat (RRI) collection as soon as we are connected,
++            // so overnight recording does not depend on a manual sync.
++            // startRriRepeat();  // 已停用：实时 RRI 保活会持续开 PPG，耗手表电；整晚数据走 sleep_data.bin
++            // Local research patch: pull the full sleep data with a wide window on connect.
++            enqueueFullSleepDump();
+             GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
+             batteryLevelReq.setFinalizeReq(new RequestCallback() {
+                 @Override
+@@ -1616,6 +1884,45 @@ public class HuaweiSupportProvider {
+     }
+ 
+     public void onFetchRecordedData(int dataTypes) {
++        // Local research patch: probe every known file id on each sync, unconditionally.
++        // The TruSleep-gated path never runs on devices whose capability bits are unknown.
++        try {
++            int end = (int) (System.currentTimeMillis() / 1000L);
++            // Local patch: the watchdog tends to answer wide windows with an empty result;
++            // 48h is the window that actually returned data during the type sweep.
++            int start = end - 48 * 3600;
++            enqueueProbeDownloads(start, end);
++        } catch (Exception e) {
++            LOG.error("Probe enqueue failed", e);
++        }
++        // Local patch: archive the raw sleep blob on every sync, not only on connect.
++        enqueueFullSleepDump();
++        // Local patch: surface the new-sync capabilities so we can tell which download
++        // protocol the device wants (old aggregate vs new per-file).
++        LOG.info("NEWSYNC truSleep={} rri={} gps={}",
++                getDeviceState().getSupportsTruSleepNewSync(),
++                getDeviceState().getSupportsRriNewSync(),
++                getDeviceState().isSupportsGpsNewSync());        // Local patch: probe services the device advertises but Gadgetbridge never implemented.
++        // probeUnknownServices();  // 已停用：空 TLV 请求被拒，且干扰下载会话
++        // Local patch: read block 0 of sleep_data.bin through 0x0A, bypassing FileInfo.
++        // probeBlockRead();  // 已停用：ACK 成功但无数据
++        // Local patch: list the sleep / rri file categories through 0x0A as well.
++        // probeListCategories();  // 已停用：0x0A 回复会被下载会话误认领，导致 NPE
++        // Local patch: ask 0x0A for the size of the interesting files (FileInfo, no transfer).
++        // probeFileInfo();  // 已停用：0x0A 干扰下载会话
++        // Local patch: download a few interesting files discovered via the 0x0A list.
++        // probeDebugDownloads();  // 已停用：0x0A 干扰下载会话        // Local patch: ask for the 0x0A debug file list once per sync.
++        // If the watch answers, we learn which files exist instead of guessing type bytes.
++        try {
++            // 已停用：0x0A 探针干扰下载会话
++            LOG.info("DEBUG_FILELIST requested");
++        } catch (Exception e) {
++            LOG.error("DEBUG_FILELIST failed", e);
++        }        // 研究期补丁已停用：RRI 实时流保活会持续点亮 PPG（耗手表电），
++        // 整晚逐拍数据从 sleep_data.bin 的 48h 窗口同步即可拿到。
++        // openRriStream();
++        // startTypeProbe();
++        // startRriRepeat();
+         for (int i = 1; i > -1; i <<= 1) {
+             if ((dataTypes & i) != 0) {
+                 switch (i) {
+@@ -2832,6 +3139,7 @@ public class HuaweiSupportProvider {
+     }
+ 
+     public void dispose() {
++        rriHandler.removeCallbacks(rriRepeat);
+         stopBatteryRunnerDelayed();
+         huaweiFileDownloadManager.dispose();
+         huaweiP2PManager.unregisterAllService();
+@@ -2978,9 +3286,10 @@ public class HuaweiSupportProvider {
+     }
+ 
+     public boolean downloadTruSleepData(int start, int end) {
+-        // We only get the data if TruSleep is supported
++        // Local research patch: the capability bit is not reported by this model, but the
++        // device does serve sleep_state.bin. Allow the normal parsing path to run.
+         if (!getDeviceState().supportsTruSleep())
+-            return false;
++            LOG.info("TRUSLEEP_PATCH capability missing, continuing anyway");
+ 
+         if (downloadDictTrueSleepData(start, end))
+             return true;
+@@ -3014,24 +3323,98 @@ public class HuaweiSupportProvider {
+             }
+         };
+ 
++        // Local research patch: the device only returns the full backlog for a wide window;
++        // the incremental window used by the sync state yields an empty file.
++        int wideEnd = (int) (System.currentTimeMillis() / 1000L);
++        int wideStart = wideEnd - 48 * 3600;
++
+         huaweiFileDownloadManager.addToQueue(HuaweiFileDownloadManager.FileRequest.sleepStateFileRequest(
+                 getDeviceState().getSupportsTruSleepNewSync(),
+-                start,
+-                end,
++                wideStart,
++                wideEnd,
+                 callback
+         ), true);
+         huaweiFileDownloadManager.addToQueue(HuaweiFileDownloadManager.FileRequest.sleepDataFileRequest(
+                 getDeviceState().getSupportsTruSleepNewSync(),
+-                start,
+-                end,
++                wideStart,
++                wideEnd,
+                 callback
+         ), true);
+         return true;
+     }
+ 
++    /**
++     * Local research patch: ask the device for every file id found in com.hihonor.health.
++     * Gadgetbridge only requests sleep_state/sleep_data/rrisqi, so the rest were never tried.
++     * Each result is logged as FILEDL_INIT name=... id=... size=..., which tells us whether
++     * the device has data for that id (size > 0) or not (size == 0 / error TLV).
++     */
++    private void enqueueProbeDownloads(int start, int end) {
++        final String[] names = {
++                "atrial_data.bin",
++                "rri_data.bin",
++                "once_rri_data.bin",
++                "osa_rri_data.bin",
++                "osa_spo2_data.bin",
++                "rri_draw_data.bin",
++                "ecg_data.bin",
++                "once_ppg_data.bin",
++                "sleep_state.bin",
++                "sleep_data.bin",
++                "rrisqi_data.bin",
++                "food_data.bin",
++                "health_arrhy_data.bin",
++                "hrv_heart_rate_data.bin",
++                "bp_measure_result.bin",
++                "bp_med_measure_data.bin",
++                "workout_data.bin",
++        };
++        final HuaweiFileDownloadManager.FileType[] types = {
++                HuaweiFileDownloadManager.FileType.ATRIAL,
++                HuaweiFileDownloadManager.FileType.RRI_DATA,
++                HuaweiFileDownloadManager.FileType.ONCE_RRI,
++                HuaweiFileDownloadManager.FileType.OSA_RRI,
++                HuaweiFileDownloadManager.FileType.OSA_SPO2,
++                HuaweiFileDownloadManager.FileType.RRI_DRAW,
++                HuaweiFileDownloadManager.FileType.ECG,
++                HuaweiFileDownloadManager.FileType.ONCE_PPG,
++                HuaweiFileDownloadManager.FileType.SLEEP_STATE,
++                HuaweiFileDownloadManager.FileType.SLEEP_DATA,
++                HuaweiFileDownloadManager.FileType.RRI,
++                HuaweiFileDownloadManager.FileType.FOOD,
++                HuaweiFileDownloadManager.FileType.ARRHY,
++                HuaweiFileDownloadManager.FileType.SEQUENCE_DATA,
++                HuaweiFileDownloadManager.FileType.BP_RESULT,
++                HuaweiFileDownloadManager.FileType.ECG_ANALYSIS_DATA,
++                HuaweiFileDownloadManager.FileType.WORKOUT,
++        };
++
++        for (int i = 0; i < names.length; i++) {
++            final String name = names[i];
++            huaweiFileDownloadManager.addToQueue(HuaweiFileDownloadManager.FileRequest.customFileRequest(
++                    name,
++                    types[i],
++                    start,
++                    end,
++                    new HuaweiFileDownloadManager.FileDownloadCallback() {
++                        @Override
++                        public void downloadComplete(HuaweiFileDownloadManager.FileRequest fileRequest, @Nullable File localRawFile) {
++                            LOG.info("FILEDL_DONE name={} bytes={}", name, fileRequest.getData().length);
++                        }
++
++                        @Override
++                        public void downloadException(HuaweiFileDownloadManager.HuaweiFileDownloadException e) {
++                            LOG.info("FILEDL_FAIL name={} error={}", name, e.getMessage());
++                        }
++                    }
++            ), false);
++        }
++    }
++
+     public boolean downloadStressData(int start, int end) {
++        // Local research patch: same as TruSleep, continue without the capability bit.
+         if (!getDeviceState().supportsAutoStress())
+-            return false;
++            LOG.info("STRESS_PATCH capability missing, continuing anyway");
+ 
+         syncState.setStressSync(true);
+ 
+@@ -3305,3 +3688,26 @@ public class HuaweiSupportProvider {
+     }
+ 
+ }
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
+index 448962a..b75ba1b 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
+@@ -143,6 +143,122 @@ public class ResponseManager {
+                     }
+                 }
+ 
++                // Local patch: surface HR / RRI samples, which Gadgetbridge otherwise drops.
++                if (receivedPacket.serviceId == 0x2C && receivedPacket.commandId == 0x01) {
++                    try {
++                        java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
++                        tlvField.setAccessible(true);
++                        nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV t =
++                                (nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV) tlvField.get(receivedPacket);
++                        if (t != null) {
++                            byte[] raw = t.serialize();
++                            StringBuilder hex = new StringBuilder();
++                            for (byte b : raw) hex.append(String.format("%02X", b));
++                            LOG.info("FILEDL_RAW len={} data={}", raw.length, hex);
++                        }
++                    } catch (Exception e) {
++                        LOG.error("FILEDL_RAW dump failed", e);
++                    }
++                }
++                // Local patch: log 0x0A FileInfo responses (file size of a named file).
++                if (receivedPacket.serviceId == 0x0A && receivedPacket.commandId == 0x03) {
++                    try {
++                        java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
++                        tlvField.setAccessible(true);
++                        nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV t =
++                                (nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV) tlvField.get(receivedPacket);
++                        if (t != null) {
++                            byte[] raw = t.serialize();
++                            StringBuilder hex = new StringBuilder();
++                            for (byte b : raw) hex.append(String.format("%02X", b));
++                            LOG.info("FILEINFO_RAW len={} data={}", raw.length, hex);
++                        }
++                    } catch (Exception e) {
++                        LOG.error("FILEINFO dump failed", e);
++                    }
++                }                // Local patch: log any answer from the services Gadgetbridge does not implement.
++                if (receivedPacket.serviceId == 0x16 || receivedPacket.serviceId == 0x1B ||
++                        receivedPacket.serviceId == 0x2E || receivedPacket.serviceId == 0x30 ||
++                        receivedPacket.serviceId == 0x35) {
++                    try {
++                        java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
++                        tlvField.setAccessible(true);
++                        nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV t =
++                                (nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV) tlvField.get(receivedPacket);
++                        if (t != null) {
++                            byte[] raw = t.serialize();
++                            StringBuilder hex = new StringBuilder();
++                            for (int i = 0; i < Math.min(raw.length, 80); i++) hex.append(String.format("%02X", raw[i]));
++                            LOG.info("UNKSVC_RESP svc=0x{} cmd=0x{} len={} head={}",
++                                    Integer.toHexString(receivedPacket.serviceId & 0xff),
++                                    Integer.toHexString(receivedPacket.commandId & 0xff),
++                                    raw.length, hex);
++                        } else {
++                            LOG.info("UNKSVC_RESP svc=0x{} cmd=0x{} tlv=null",
++                                    Integer.toHexString(receivedPacket.serviceId & 0xff),
++                                    Integer.toHexString(receivedPacket.commandId & 0xff));
++                        }
++                    } catch (Exception e) {
++                        LOG.error("UNKSVC dump failed", e);
++                    }
++                }                // Local patch: log 0x0A block ack (0x04) and block data header (0x05).
++                if (receivedPacket.serviceId == 0x0A && (receivedPacket.commandId == 0x04 || receivedPacket.commandId == 0x05)) {
++                    try {
++                        java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
++                        tlvField.setAccessible(true);
++                        nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV t =
++                                (nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV) tlvField.get(receivedPacket);
++                        String cmd = receivedPacket.commandId == 0x04 ? "BLOCKACK" : "BLOCKDATA";
++                        if (t != null) {
++                            byte[] raw = t.serialize();
++                            StringBuilder hex = new StringBuilder();
++                            for (int i = 0; i < Math.min(raw.length, 48); i++) hex.append(String.format("%02X", raw[i]));
++                            LOG.info("{} len={} head={}", cmd, raw.length, hex);
++                        } else {
++                            LOG.info("{} tlv=null", cmd);
++                        }
++                    } catch (Exception e) {
++                        LOG.error("0x0A block dump failed", e);
++                    }
++                }                // Local patch: log the 0x0A debug-file-list response (semicolon separated names).
++                if (receivedPacket.serviceId == 0x0A && receivedPacket.commandId == 0x01) {
++                    try {
++                        java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
++                        tlvField.setAccessible(true);
++                        nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV t =
++                                (nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV) tlvField.get(receivedPacket);
++                        if (t != null) {
++                            byte[] raw = t.serialize();
++                            StringBuilder hex = new StringBuilder();
++                            for (byte b : raw) hex.append(String.format("%02X", b));
++                            LOG.info("FILEDL0A_RAW len={} data={}", raw.length, hex);
++                            if (t.contains(0x01)) {
++                                LOG.info("FILEDL0A_NAMES {}", t.getString(0x01));
++                            }
++                        }
++                    } catch (Exception e) {
++                        LOG.error("FILEDL0A dump failed", e);
++                    }
++                }                if (receivedPacket.serviceId == 0x19 && receivedPacket.commandId == 0x05) {
++                    try {
++                        java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
++                        tlvField.setAccessible(true);
++                        nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV t =
++                                (nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV) tlvField.get(receivedPacket);
++                        if (t != null) {
++                            byte[] raw = t.serialize();
++                            StringBuilder hex = new StringBuilder();
++                            for (byte b : raw) hex.append(String.format("%02X", b));
++                            LOG.info("HRRRI_RAW len={} data={}", raw.length, hex);
++                            appendRriToFile(raw);
++                        } else {
++                            LOG.info("HRRRI_RAW tlv=null class={}", receivedPacket.getClass().getSimpleName());
++                        }
++                    } catch (Exception e) {
++                        LOG.error("HRRRI_RAW dump failed", e);
++                    }
++                }
++
+                 if (handler == null) {
+                     if (LOG.isDebugEnabled()) {
+                         LOG.debug("Service: {}, command: {}, asynchronous response.", Integer.toHexString(receivedPacket.serviceId & 0xff), Integer.toHexString(receivedPacket.commandId & 0xff));
+@@ -167,4 +283,62 @@ public class ResponseManager {
+             }
+         } while (left > 0);
+     }
++
++    /**
++     * Local research patch: append decoded RRI/SQI pairs to a daily CSV so overnight
++     * beat-to-beat data survives without a computer attached.
++     * Layout: data/rri/rri_YYYYMMDD.csv with rows {@code epoch_ms,rri_ms,sqi}.
++     */
++    private static void appendRriToFile(byte[] raw) {
++        try {
++            long ts = 0;
++            int curRri = -1;
++            List<int[]> pairs = new ArrayList<>();
++            int i = 0;
++            while (i + 2 <= raw.length) {
++                int tag = raw[i] & 0xFF;
++                int len = raw[i + 1] & 0xFF;
++                int start = i + 2;
++                int end = start + len;
++                if (end > raw.length) break;
++                if (tag == 0x82 || tag == 0x83) {
++                    i = start;                       // descend into container
++                    continue;
++                }
++                if (tag == 0x01 && len == 4) {
++                    ts = ((long) (raw[start] & 0xFF) << 24) | ((raw[start + 1] & 0xFF) << 16)
++                            | ((raw[start + 2] & 0xFF) << 8) | (raw[start + 3] & 0xFF);
++                } else if (tag == 0x04 && len == 2) {
++                    curRri = ((raw[start] & 0xFF) << 8) | (raw[start + 1] & 0xFF);
++                } else if (tag == 0x05 && len == 1) {
++                    int sqi = raw[start] & 0xFF;
++                    if (curRri > 0 && sqi > 0) pairs.add(new int[]{curRri, sqi});
++                    curRri = -1;
++                }
++                i = end;
++            }
++            if (pairs.isEmpty() || ts <= 0) return;
++
++            java.io.File dir = new java.io.File(
++                    nodomain.freeyourgadget.gadgetbridge.GBApplication.getContext().getExternalFilesDir(null),
++                    "rri");
++            if (!dir.exists() && !dir.mkdirs()) return;
++            java.io.File out = new java.io.File(dir, "rri_" + new java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(new java.util.Date())
++                    + ".csv");
++            boolean fresh = !out.exists();
++            try (java.io.FileWriter fw = new java.io.FileWriter(out, true)) {
++                if (fresh) fw.write("epoch_s,rri_ms,sqi\n");
++                for (int[] p : pairs) {
++                    fw.write(ts + "," + p[0] + "," + p[1] + "\n");
++                }
++            }
++        } catch (Exception e) {
++            LOG.error("RRI file append failed", e);
++        }
++    }
+ }
++
++
++
++
++
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetFileDownloadInitRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetFileDownloadInitRequest.java
+index 68d4c51..c9da476 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetFileDownloadInitRequest.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetFileDownloadInitRequest.java
+@@ -52,16 +52,8 @@ public class GetFileDownloadInitRequest extends Request {
+     }
+ 
+     private FileDownloadService2C.FileType convertFileTypeTo2C(HuaweiFileDownloadManager.FileType type) {
+-        return switch (type) {
+-            case SLEEP_STATE -> FileDownloadService2C.FileType.SLEEP_STATE;
+-            case SLEEP_DATA -> FileDownloadService2C.FileType.SLEEP_DATA;
+-            case RRI -> FileDownloadService2C.FileType.RRI;
+-            case GPS -> FileDownloadService2C.FileType.GPS;
+-            case PDR -> FileDownloadService2C.FileType.PDR;
+-            case SEQUENCE_DATA -> FileDownloadService2C.FileType.SEQUENCE_DATA;
+-            case ECG_ANALYSIS_DATA -> FileDownloadService2C.FileType.ECG_ANALYSIS_DATA;
+-            default -> FileDownloadService2C.FileType.UNKNOWN;
+-        };
++        // Local patch: map by raw byte so every file id stays usable.
++        return FileDownloadService2C.FileType.byteToFileType(type.value);
+     }
+ 
+     private HuaweiFileDownloadManager.FileType convertFileTypeFrom2C(FileDownloadService2C.FileType type) {
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendBlockProbeRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendBlockProbeRequest.java
+new file mode 100644
+index 0000000..feca55d
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendBlockProbeRequest.java
+@@ -0,0 +1,38 @@
++/*  Local research patch (not upstream): read a file through 0x0A by asking for block 0.
++
++    FileInfo reported 0 bytes even for sleep_data.bin, which we know is 78052 bytes via
++    0x2C — so the size call is not usable. This probe skips it and requests the first
++    block directly; the reply (0x04 ack + 0x05 data) tells us whether 0x0A can deliver
++    content at all. */
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import java.util.List;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.FileDownloadService0A;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++
++public class SendBlockProbeRequest extends Request {
++    private final String fileName;
++    private final int offset;
++    private final int size;
++
++    public SendBlockProbeRequest(HuaweiSupportProvider support, String fileName, int offset, int size) {
++        super(support);
++        this.fileName = fileName;
++        this.offset = offset;
++        this.size = size;
++        this.serviceId = FileDownloadService0A.id;
++        this.commandId = FileDownloadService0A.RequestBlock.id;
++        this.addToResponse = false;
++    }
++
++    @Override
++    protected List<byte[]> createRequest() throws Request.RequestCreationException {
++        try {
++            return new FileDownloadService0A.RequestBlock.Request(paramsProvider, fileName, offset, size).serialize();
++        } catch (HuaweiPacket.CryptoException e) {
++            throw new Request.RequestCreationException(e);
++        }
++    }
++}
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendDebugFileListRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendDebugFileListRequest.java
+new file mode 100644
+index 0000000..4c8a5cf
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendDebugFileListRequest.java
+@@ -0,0 +1,31 @@
++/*  Local research patch (not upstream): ask the watch for its debug file list.
++
++    Service 0x0A is the "older devices" file download channel. Its DebugFilesRequest
++    carries an empty TLV and the response (tag 0x01) is a semicolon separated list of
++    file names — i.e. the closest thing to a directory listing the protocol offers.
++    If the device answers, we learn what files exist instead of guessing type ids. */
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import java.util.List;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.FileDownloadService0A;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++
++public class SendDebugFileListRequest extends Request {
++    public SendDebugFileListRequest(HuaweiSupportProvider support) {
++        super(support);
++        this.serviceId = FileDownloadService0A.id;
++        this.commandId = FileDownloadService0A.FileDownloadInit.id;
++        this.addToResponse = false;
++    }
++
++    @Override
++    protected List<byte[]> createRequest() throws Request.RequestCreationException {
++        try {
++            return new FileDownloadService0A.FileDownloadInit.DebugFilesRequest(paramsProvider).serialize();
++        } catch (HuaweiPacket.CryptoException e) {
++            throw new Request.RequestCreationException(e);
++        }
++    }
++}
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendFileInfoProbeRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendFileInfoProbeRequest.java
+new file mode 100644
+index 0000000..347636e
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendFileInfoProbeRequest.java
+@@ -0,0 +1,34 @@
++/*  Local research patch (not upstream): ask 0x0A for a file's size without downloading it.
++
++    The 0x0A debug flow is: 0x01 init (empty TLV, returns the file list) ->
++    0x02 FileParameters -> 0x03 FileInfo(fileName) -> 0x04 blocks -> 0x06 complete.
++    Gadgetbridge only implements the list part for DEBUG, so we probe FileInfo directly
++    to learn whether a named file exists and how large it is. */
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import java.util.List;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.FileDownloadService0A;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++
++public class SendFileInfoProbeRequest extends Request {
++    private final String fileName;
++
++    public SendFileInfoProbeRequest(HuaweiSupportProvider support, String fileName) {
++        super(support);
++        this.fileName = fileName;
++        this.serviceId = FileDownloadService0A.id;
++        this.commandId = FileDownloadService0A.FileInfo.id;
++        this.addToResponse = false;
++    }
++
++    @Override
++    protected List<byte[]> createRequest() throws Request.RequestCreationException {
++        try {
++            return new FileDownloadService0A.FileInfo.Request(paramsProvider, fileName).serialize();
++        } catch (HuaweiPacket.CryptoException e) {
++            throw new Request.RequestCreationException(e);
++        }
++    }
++}
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendFileParametersProbe.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendFileParametersProbe.java
+new file mode 100644
+index 0000000..d1bb5d6
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendFileParametersProbe.java
+@@ -0,0 +1,43 @@
++/*  Local research patch (not upstream): send 0x0A FileParameters before FileInfo.
++
++    The documented 0x0A flow is init -> FileParameters -> FileInfo -> blocks -> complete.
++    FileInfo answered 0 bytes for every file when called directly, so we replay the
++    missing step: FileParameters carries an empty TLV for debug files. */
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import java.util.List;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.FileDownloadService0A;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++
++public class SendFileParametersProbe extends Request {
++    public SendFileParametersProbe(HuaweiSupportProvider support) {
++        super(support);
++        this.serviceId = FileDownloadService0A.id;
++        this.commandId = FileDownloadService0A.FileParameters.id;
++        this.addToResponse = false;
++    }
++
++    @Override
++    protected List<byte[]> createRequest() throws Request.RequestCreationException {
++        try {
++            FileDownloadService0A.FileParameters.Request req =
++                    new FileDownloadService0A.FileParameters.Request(paramsProvider, (byte) 0x00);
++            // FileParameters leaves tlv null for debug files, which makes serialize() throw.
++            // Fill in an empty TLV so the packet is well formed.
++            try {
++                java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
++                tlvField.setAccessible(true);
++                if (tlvField.get(req) == null) {
++                    tlvField.set(req, new nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV());
++                }
++            } catch (Exception ignored) {
++            }
++            return req.serialize();
++        } catch (HuaweiPacket.CryptoException e) {
++            throw new Request.RequestCreationException(e);
++        }
++    }
++}
++
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendListCategoryProbeRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendListCategoryProbeRequest.java
+new file mode 100644
+index 0000000..dbe0dc4
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendListCategoryProbeRequest.java
+@@ -0,0 +1,50 @@
++/*  Local research patch (not upstream): list the other 0x0A file categories.
++
++    The debug list only shows debug slots. The same init command has variants for
++    sleep files (0x01) and rri files (0x04); each may answer with its own file list,
++    which would tell us whether the watch stores per-night files instead of one blob. */
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import java.util.List;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.FileDownloadService0A;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++
++public class SendListCategoryProbeRequest extends Request {
++    public enum Category { DEBUG, SLEEP, RRI }
++
++    private final Category category;
++    private final int startTime;
++    private final int endTime;
++
++    public SendListCategoryProbeRequest(HuaweiSupportProvider support, Category category,
++                                        int startTime, int endTime) {
++        super(support);
++        this.category = category;
++        this.startTime = startTime;
++        this.endTime = endTime;
++        this.serviceId = FileDownloadService0A.id;
++        this.commandId = FileDownloadService0A.FileDownloadInit.id;
++        this.addToResponse = false;
++    }
++
++    @Override
++    protected List<byte[]> createRequest() throws Request.RequestCreationException {
++        try {
++            switch (category) {
++                case SLEEP:
++                    return new FileDownloadService0A.FileDownloadInit
++                            .SleepFilesRequest(paramsProvider, startTime, endTime).serialize();
++                case RRI:
++                    return new FileDownloadService0A.FileDownloadInit
++                            .RriFileRequest(paramsProvider, startTime, endTime).serialize();
++                default:
++                    return new FileDownloadService0A.FileDownloadInit
++                            .DebugFilesRequest(paramsProvider).serialize();
++            }
++        } catch (HuaweiPacket.CryptoException e) {
++            throw new Request.RequestCreationException(e);
++        }
++    }
++}
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendRawFileProbeRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendRawFileProbeRequest.java
+new file mode 100644
+index 0000000..c390851
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendRawFileProbeRequest.java
+@@ -0,0 +1,38 @@
++/*  Local research patch (not upstream): send a FileDownloadInit with an arbitrary
++    file-type byte, to discover which type ids the device actually accepts. */
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import java.util.List;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.FileDownloadService2C;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++
++public class SendRawFileProbeRequest extends Request {
++    private final String filename;
++    private final byte fileType;
++    private final int startTime;
++    private final int endTime;
++
++    public SendRawFileProbeRequest(HuaweiSupportProvider support, String filename, byte fileType,
++                                   int startTime, int endTime) {
++        super(support);
++        this.filename = filename;
++        this.fileType = fileType;
++        this.startTime = startTime;
++        this.endTime = endTime;
++        this.serviceId = FileDownloadService2C.id;
++        this.commandId = (byte) FileDownloadService2C.FileDownloadInit.id;
++        this.addToResponse = false;
++    }
++
++    @Override
++    protected List<byte[]> createRequest() throws Request.RequestCreationException {
++        try {
++            return new FileDownloadService2C.FileDownloadInit.Request(
++                    paramsProvider, filename, fileType, startTime, endTime).serialize();
++        } catch (HuaweiPacket.CryptoException e) {
++            throw new Request.RequestCreationException(e);
++        }
++    }
++}
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendUnknownServiceProbeRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendUnknownServiceProbeRequest.java
+new file mode 100644
+index 0000000..cda395b
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendUnknownServiceProbeRequest.java
+@@ -0,0 +1,49 @@
++/*  Local research patch (not upstream): probe services the watch advertises but
++    Gadgetbridge never implemented.
++
++    The device reports its capabilities in huawei_coordinator_capabilities_*.xml.
++    Five of those services have no Gadgetbridge implementation at all:
++      0x16 (commands 01,03,07), 0x1B (01,0F,19), 0x2E (none), 0x30 (01), 0x35 (03,04)
++    We send the first command of each with an empty TLV and log whatever comes back,
++    which is the cheapest way to find out whether another data channel exists. */
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import java.util.List;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++
++public class SendUnknownServiceProbeRequest extends Request {
++    private final int probeServiceId;
++    private final int probeCommandId;
++
++    public SendUnknownServiceProbeRequest(HuaweiSupportProvider support, int serviceId, int commandId) {
++        super(support);
++        this.probeServiceId = serviceId;
++        this.probeCommandId = commandId;
++        this.serviceId = (byte) serviceId;
++        this.commandId = (byte) commandId;
++        this.addToResponse = false;
++    }
++
++    @Override
++    protected List<byte[]> createRequest() throws Request.RequestCreationException {
++        try {
++            HuaweiPacket packet = new HuaweiPacket(paramsProvider) {
++            };
++            packet.serviceId = (byte) probeServiceId;
++            packet.commandId = (byte) probeCommandId;
++            java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
++            tlvField.setAccessible(true);
++            tlvField.set(packet, new HuaweiTLV());
++            java.lang.reflect.Field completeField = HuaweiPacket.class.getDeclaredField("complete");
++            completeField.setAccessible(true);
++            completeField.set(packet, true);
++            return packet.serialize();
++        } catch (Exception e) {
++            throw new Request.RequestCreationException(String.valueOf(e));
++        }
++    }
++}
++
+diff --git a/app/src/main/res/xml/preferences_periodic_sync.xml b/app/src/main/res/xml/preferences_periodic_sync.xml
+new file mode 100644
+index 0000000..c7d78ac
+--- /dev/null
++++ b/app/src/main/res/xml/preferences_periodic_sync.xml
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="utf-8"?>
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    app:iconSpaceReserved="false">
++
++    <ListPreference
++        android:defaultValue="6"
++        android:entries="@array/periodic_sync_entries"
++        android:entryValues="@array/periodic_sync_values"
++        android:key="pref_periodic_sync_interval"
++        android:summary="@string/pref_periodic_sync_summary"
++        android:title="@string/pref_periodic_sync_title" />
++
++</PreferenceScreen>
+

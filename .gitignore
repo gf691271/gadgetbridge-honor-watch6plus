@@ -1,0 +1,7 @@
+*.apk
+*.bin
+*.db
+build/
+.gradle/
+__pycache__/
+*.pyc
