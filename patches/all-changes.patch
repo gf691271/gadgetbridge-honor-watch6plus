@@ -45,10 +45,10 @@ index 5bb5f45..abfac1a 100644
  }
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-index 096543c..afe8418 100644
+index 096543c..c4bc517 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-@@ -2,10 +2,17 @@ package nodomain.freeyourgadget.gadgetbridge.database
+@@ -2,82 +2,746 @@ package nodomain.freeyourgadget.gadgetbridge.database
  
  import android.content.Context
  import android.content.Intent
@@ -61,12 +61,14 @@ index 096543c..afe8418 100644
  import androidx.work.Worker
  import androidx.work.WorkerParameters
 +import com.google.gson.JsonArray
++import com.google.gson.JsonNull
 +import com.google.gson.JsonObject
 +import nodomain.freeyourgadget.gadgetbridge.BuildConfig
  import nodomain.freeyourgadget.gadgetbridge.GBApplication
  import nodomain.freeyourgadget.gadgetbridge.GBDatabaseManager
  import nodomain.freeyourgadget.gadgetbridge.R
-@@ -13,71 +20,697 @@ import nodomain.freeyourgadget.gadgetbridge.util.GB
++import nodomain.freeyourgadget.gadgetbridge.util.DeviceClockTracker
+ import nodomain.freeyourgadget.gadgetbridge.util.GB
  import nodomain.freeyourgadget.gadgetbridge.util.GBPrefs
  import org.slf4j.Logger
  import org.slf4j.LoggerFactory
@@ -442,11 +444,34 @@ index 096543c..afe8418 100644
 +            )?.use { c -> while (c.moveToNext()) names.add(c.getString(0) ?: "") }
 +        } catch (e: Exception) {
 +            LOG.warn("listing export dir failed", e)
-+        }
+         }
 +        return names
 +    }
-+
+ 
+-        LOG.info("Broadcasting database export success={}", success)
 +    // ---- manifest ------------------------------------------------------------
+ 
+-        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
+-        val exportedNotifyIntent = Intent(action)
+-        mContext.sendBroadcast(exportedNotifyIntent)
++    /**
++     * Device clock relative to the phone clock, from the last SetTime response.
++     * Values are null / "unavailable" until a device has actually reported its time.
++     */
++    private fun deviceClockJson(): JsonObject {
++        val o = JsonObject()
++        val offset = DeviceClockTracker.getOffsetSeconds()
++        if (offset == null) {
++            o.add("offset_seconds", JsonNull.INSTANCE)
++            o.add("measured_at_utc", JsonNull.INSTANCE)
++            o.addProperty("source", DeviceClockTracker.SOURCE_UNAVAILABLE)
++        } else {
++            o.addProperty("offset_seconds", offset)
++            o.addProperty("measured_at_utc", isoUtc(DeviceClockTracker.getMeasuredAtEpochSeconds()))
++            o.addProperty("source", DeviceClockTracker.SOURCE_SET_TIME_RESPONSE)
++        }
++        return o
++    }
 +
 +    private fun writeManifest(
 +        location: Uri,
@@ -459,6 +484,10 @@ index 096543c..afe8418 100644
 +            val root = JsonObject()
 +            root.addProperty("schema", SCHEMA_VERSION)
 +            root.addProperty("exported_at_utc", isoUtc(System.currentTimeMillis() / 1000))
++            // Device clock is measured from the SetTime response, which Gadgetbridge
++            // requests on every connection. If no response was seen in this process,
++            // offset_seconds and measured_at_utc are null and source is "unavailable".
++            root.add("device_clock", deviceClockJson())
 +            root.addProperty("timezone", TimeZone.getDefault().id)
 +            root.addProperty("file_name_timezone", TimeZone.getDefault().id)
 +            root.addProperty("window_from_epoch_s", fromSec)
@@ -555,7 +584,13 @@ index 096543c..afe8418 100644
 +                requireNotNull(out) { "no output stream for $name" }
 +                OutputStreamWriter(out, Charsets.UTF_8).buffered().use { w -> w.write(root.toString()) }
 +            }
-+            LOG.info("Wrote manifest {}", name)
++            LOG.info(
++                "Wrote manifest {} (device_clock source={}, offset_seconds={})",
++                name,
++                DeviceClockTracker.getOffsetSeconds()?.let { DeviceClockTracker.SOURCE_SET_TIME_RESPONSE }
++                    ?: DeviceClockTracker.SOURCE_UNAVAILABLE,
++                DeviceClockTracker.getOffsetSeconds()
++            )
 +        } catch (e: Exception) {
 +            LOG.error("Failed writing manifest", e)
 +        }
@@ -667,12 +702,11 @@ index 096543c..afe8418 100644
 +            }
 +        } catch (e: Exception) {
 +            LOG.warn("Failed to prune $prefix entries", e)
-         }
++        }
 +    }
 +
 +    // ---- helpers -------------------------------------------------------------
- 
--        LOG.info("Broadcasting database export success={}", success)
++
 +    /** Cursors live in a file: WorkManager runs did not reliably persist them in SharedPreferences. */
 +    private fun cursorFile() = java.io.File(mContext.getExternalFilesDir(null), "export_state.txt")
 +
@@ -684,10 +718,7 @@ index 096543c..afe8418 100644
 +    } catch (e: Exception) {
 +        LOG.warn("Failed to read cursor {}", key, e); 0L
 +    }
- 
--        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
--        val exportedNotifyIntent = Intent(action)
--        mContext.sendBroadcast(exportedNotifyIntent)
++
 +    private fun writeCursor(key: String, value: Long) {
 +        try {
 +            val f = cursorFile()
@@ -2279,6 +2310,89 @@ index 0000000..cda395b
 +    }
 +}
 +
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SetTimeRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SetTimeRequest.java
+index e33ccd9..8e09996 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SetTimeRequest.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SetTimeRequest.java
+@@ -24,6 +24,7 @@ import java.util.List;
+ import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
+ import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.DeviceConfig;
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++import nodomain.freeyourgadget.gadgetbridge.util.DeviceClockTracker;
+ 
+ public class SetTimeRequest extends Request {
+     private static final Logger LOG = LoggerFactory.getLogger(SetTimeRequest.class);
+@@ -55,6 +56,10 @@ public class SetTimeRequest extends Request {
+         int systemTime = (int) (System.currentTimeMillis() / 1000);
+         int diff = Math.abs(systemTime - deviceTime);
+         LOG.debug("systemTime: {} deviceTime: {} diff: {}",systemTime, deviceTime, diff);
++        // Local research patch: remember the device clock for the export manifest.
++        Integer clockOffset = DeviceClockTracker.recordDeviceTime(deviceTime);
++        LOG.info("DEVICE_CLOCK source=set_time_response deviceTime={} phoneTime={} offset_seconds={}",
++                deviceTime, systemTime, clockOffset);
+         if (this.checkTime && diff > 0) {
+             SetTimeRequest setTimeReq = new SetTimeRequest(supportProvider, false);
+             setTimeReq.nextRequest(this.nextRequest);
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/DeviceClockTracker.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/DeviceClockTracker.java
+new file mode 100644
+index 0000000..29231db
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/DeviceClockTracker.java
+@@ -0,0 +1,54 @@
++/*  Local research patch: remember the last device clock reading.
++
++    Gadgetbridge sends a SetTimeRequest on every connection and the device replies
++    with its own epoch seconds (DeviceConfig.TimeRequest.Response.deviceTime).
++    We keep the resulting offset in a static field so the database export worker
++    can write it into the manifest, and fall back to "unavailable" when no
++    response has been seen in this process. */
++
++package nodomain.freeyourgadget.gadgetbridge.util;
++
++public final class DeviceClockTracker {
++    public static final String SOURCE_SET_TIME_RESPONSE = "set_time_response";
++    public static final String SOURCE_UNAVAILABLE = "unavailable";
++
++    private static volatile boolean available = false;
++    private static volatile int offsetSeconds = 0;
++    private static volatile long measuredAtEpochSeconds = 0L;
++
++    private DeviceClockTracker() {
++    }
++
++    /**
++     * Record a device clock reading. Returns the offset (device - phone) in seconds,
++     * or null when the reading is not usable.
++     */
++    public static Integer recordDeviceTime(int deviceEpochSeconds) {
++        if (deviceEpochSeconds <= 0) {
++            return null;
++        }
++        long device = deviceEpochSeconds & 0xFFFFFFFFL;
++        long phone = System.currentTimeMillis() / 1000L;
++        int offset = (int) (device - phone);
++        synchronized (DeviceClockTracker.class) {
++            offsetSeconds = offset;
++            measuredAtEpochSeconds = phone;
++            available = true;
++        }
++        return offset;
++    }
++
++    public static synchronized boolean isAvailable() {
++        return available;
++    }
++
++    /** Device time minus phone time, in seconds; null if never measured. */
++    public static synchronized Integer getOffsetSeconds() {
++        return available ? offsetSeconds : null;
++    }
++
++    /** Phone epoch seconds at the moment the device time was measured; 0 if never. */
++    public static synchronized long getMeasuredAtEpochSeconds() {
++        return measuredAtEpochSeconds;
++    }
++}
 diff --git a/app/src/main/res/xml/preferences_periodic_sync.xml b/app/src/main/res/xml/preferences_periodic_sync.xml
 new file mode 100644
 index 0000000..c7d78ac
