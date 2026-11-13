@@ -119,3 +119,43 @@
 - `ResponseManager` 里的原始包日志降级或删掉（刷屏）
 - 确认 `keys/README.md` 里的密钥丢失说明仍然准确
 
+
+---
+
+## 2026-11-13 收工时的实际状态
+
+已完成并验证：
+
+| 项 | 证据 |
+|---|---|
+| RRI 逐拍抓取 | `rri_20261113.csv`，实时流每包 143 字节 |
+| 健康开关每次连接重下发 | `HEALTHSW ... pushed` + 手表 `Service: 2d` 应答 |
+| 忙碌看门狗 | 已装，未触发 |
+| RRI 进导出清单 | 已装，待 00:00 验证 |
+| 每晚上验收脚本 | `tools/nightly-check.ps1`，仅语法验证过 |
+| 时钟偏移 | 已实现，但偏移恒为 0（见下） |
+
+### 时钟偏移的已知缺陷
+
+GB 每次连接都推时间，所以测到的是**推送后的残余偏差**，不是真实漂移。
+要测真实漂移，需要在 `SetTimeRequest` 发出**之前**采样手机时间，并在响应到达后
+计算 —— 改 `SetTimeRequest` 的时序即可，但会改动握手流程，需谨慎。
+
+### 下一轮的第一件事
+
+按 [`0x0a-session-plan.md`](0x0a-session-plan.md) 的 **第 1 步**开始：
+纯观测，不改协议逻辑，只把 0x0A/0x05 的实际到达情况打印出来。
+
+关键前提（方案文档里已论证）：之前所有探针都是 `addToResponse=false`，
+等于主动不接收 0x0A/0x05；而且 0x0A/0x05 被解析为非 TLV，
+`tlv == null` 恰恰说明数据到了，不是失败。
+
+### 一个有用的操作技巧
+
+导出可以手动触发，不必等到 00:00：
+
+```
+prefs 里设 intent_api_allow_trigger_export = true
+adb shell am broadcast -a nodomain.freeyourgadget.gadgetbridge.TRIGGER_DATABASE_EXPORT
+（完成后记得把 pref 恢复）
+```
