@@ -35,7 +35,8 @@ $fails = 0
 Write-Output "=== nightly check $(Get-Date -Format 'yyyy-MM-dd HH:mm') ==="
 
 # --- 1. 认证 ------------------------------------------------------------
-if (-not (& $adb pull "/sdcard/Android/data/$pkg/files/gadgetbridge.log" $log 2>&1 | Out-Null; Test-Path $log)) {
+& $adb pull "/sdcard/Android/data/$pkg/files/gadgetbridge.log" $log 2>&1 | Out-Null
+if (-not (Test-Path $log)) {
     $fails += Fail 'cannot read gadgetbridge.log'
 } else {
     $auth = Select-String -Path $log -Pattern 'mutual auth OK' | Select-Object -Last 1
