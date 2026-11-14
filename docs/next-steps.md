@@ -4,7 +4,7 @@
 
 ---
 
-## P0 — manifest 改成真正机器可读
+## ~~P0 — manifest 改成真正机器可读~~ ✅ 已完成（schema 4 → 5）
 
 **现状问题**
 
@@ -40,7 +40,10 @@
 
 ---
 
-## P0 — 给下游项目提 issue，钉死文件契约
+## ~~P0 — 给下游项目提 issue，钉死文件契约~~ ✅ 已提 PR（mailuo #1）
+
+契约文档在 `gf691271/mailuo` 的 `docs/integrations/gadgetbridge.md`（分支 `docs/gb-data-contract`），
+已覆盖到 schema 5，附带真机导出的脱敏 manifest 样例。
 
 下游程序 **不依赖 Gadgetbridge 代码**，只读导出目录。所以契约必须写死：
 
@@ -159,3 +162,46 @@ prefs 里设 intent_api_allow_trigger_export = true
 adb shell am broadcast -a nodomain.freeyourgadget.gadgetbridge.TRIGGER_DATABASE_EXPORT
 （完成后记得把 pref 恢复）
 ```
+
+注意广播的 action 是 **`nodomain.freeyourgadget.gadgetbridge.command.TRIGGER_DATABASE_EXPORT`**
+（带 `.command.`），旧的不带 `.command.` 的形式已废弃。
+
+---
+
+## 2026-11-14 收工时的实际状态
+
+已完成并**真机验证**（不是"应该能用"）：
+
+| 项 | 证据 |
+|---|---|
+| 夜间窗口 00:00–08:00（本地时区） | 代码 `RRI_WINDOW_START_HOUR=0` / `END=8`；19:33 之后 `rri_20261114.csv` 不再增长 |
+| 出窗口主动关流 | `closeRriStream()` 发 `0x19/0x01 type=4`，靠 `lastRriPacketMs` 判断流是否真的活着 |
+| 采集状态时间线 | `files/rri/capture_20261114.csv` 已生成：`1794659057,session_start_outside_window` |
+| 归档内容寻址（schema 5） | 导出目录只剩 5 个 `raw-*`，`raw-rri_20261109.csv (1)` 这类重复被自动清掉 |
+| 同名不同内容能更新 | `raw-rri_20261113.csv` 从 77945 字节重写成 181079；`raw-sleep_data.bin` 稳定名 105716 |
+| `(1)` 重复的根因 | 旧逻辑靠目录列表判断"已归档"，列表偶尔为空就再建一个同名文件 |
+| 0x0A 块读实验 | `Send0ABlockSizeProbe` 调用已注释；29 次以上零返回 |
+| 发布补丁完整性 | `all-changes.patch` 从 18 个文件补到 27 个（之前漏了 AndroidManifest / GBApplication 的定时同步接线），`git apply --check` 通过 |
+
+### 今晚要验的三件事
+
+1. **00:00 开流**：`capture_<明天>.csv` 应出现 `open_requested`，且 `rri_<明天>.csv` 开始有行
+2. **08:00 关流**：应出现 `close_requested`，之后 csv 不再增长
+3. **耗电**：整夜应 ≈3%（RRI 全天开是 2.5%/小时）
+
+判定脚本：`tools/nightly-check.ps1`（仍未在真机上跑过，明早第一次跑要顺手修）。
+
+### 已知但没修的
+
+| 项 | 说明 |
+|---|---|
+| `sleep_data.bin` 每 30 分钟重下一次 | 105716 字节内容常常一模一样，应该先问设备要 hash 再决定下不下（`GetFileHashRequest` 已存在但没接） |
+| 时钟偏移恒为 0 | GB 连接时就推时间，测到的是推送后的残余偏差，不是真实漂移 |
+| 压力开关 | `setStress()` 需要校准数据，没有就自己复位成 false |
+| 日志会在 force-stop 时丢尾巴 | logback appender 是 `lazy` + `immediateFlush=false`；所以采集时间线用独立文件立即落盘，不要只看 log |
+
+### 下一轮的第一件事
+
+先在真机上跑一次 `tools/nightly-check.ps1`，把它的误报修掉 —— 它是唯一能自动判定
+"今晚数据到底行不行"的东西，现在是纯手工验证。
+
