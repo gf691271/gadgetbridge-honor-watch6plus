@@ -1207,7 +1207,7 @@ index 583c919..871d58f 100644
                          // Nothing to download, go to end
                          fileComplete();
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..a3a56e1 100644
+index 19582f3..03b147a 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -1226,17 +1226,37 @@ index 19582f3..a3a56e1 100644
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGpsDataRequest;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFileUploadInfo;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHeartRateZonesConfig;
-@@ -281,6 +283,267 @@ public class HuaweiSupportProvider {
+@@ -281,6 +283,287 @@ public class HuaweiSupportProvider {
      private boolean gpsEnabled = false;
      private Location gpsLastLocation;
  
 +    /** Local research patch: whether the beat-to-beat (RRI) stream was opened this session. */
 +    private boolean rriStreamOpened = false;
 +    private final android.os.Handler rriHandler = new android.os.Handler(android.os.Looper.getMainLooper());
++    /**
++     * Local research patch: only keep the beat-to-beat stream open between 00:00 and 08:00
++     * local time. Daytime drain measured at ~2.5%/h with the stream open versus ~0%/h
++     * without it; overnight it costs about 3% in total, which is acceptable.
++     * Uses the device default time zone on purpose, so the window follows the user
++     * when travelling instead of shifting by the UTC offset.
++     */
++    private static final int RRI_WINDOW_START_HOUR = 0;
++    private static final int RRI_WINDOW_END_HOUR = 8;
++
++    private static boolean insideRriWindow() {
++        int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
++        return hour >= RRI_WINDOW_START_HOUR && hour < RRI_WINDOW_END_HOUR;
++    }
++
 +    private final Runnable rriRepeat = new Runnable() {
 +        @Override
 +        public void run() {
-+            openRriStream();
++            if (insideRriWindow()) {
++                openRriStream();
++            } else if (rriStreamOpened) {
++                LOG.info("RRI_WINDOW outside window, stream left to expire");
++                rriStreamOpened = false;
++            }
 +            rriHandler.postDelayed(this, 15000);
 +        }
 +    };
@@ -1494,7 +1514,7 @@ index 19582f3..a3a56e1 100644
      private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
  
      protected ResponseManager responseManager = new ResponseManager(this);
-@@ -817,6 +1080,18 @@ public class HuaweiSupportProvider {
+@@ -817,6 +1100,18 @@ public class HuaweiSupportProvider {
              huaweiDataSyncManager.unregisterAll();
              this.huaweiDataSyncTreeCircleGoals = null;
              stopBatteryRunnerDelayed();
@@ -1513,7 +1533,7 @@ index 19582f3..a3a56e1 100644
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +1891,45 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +1911,49 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
@@ -1539,6 +1559,10 @@ index 19582f3..a3a56e1 100644
 +        // probeUnknownServices();  // 已停用：空 TLV 请求被拒，且干扰下载会话
 +        // Local patch: read block 0 of sleep_data.bin through 0x0A, bypassing FileInfo.
 +        // probeBlockRead();  // 已停用：ACK 成功但无数据
++        // Local research patch: block-size experiment (21428 / 974 / 9740). To revert, comment
++        // out this single call; the class does nothing unless it is invoked.
++        nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                .Send0ABlockSizeProbe.start(this);
 +        // Local patch: list the sleep / rri file categories through 0x0A as well.
 +        // probeListCategories();  // 已停用：0x0A 回复会被下载会话误认领，导致 NPE
 +        // Local patch: ask 0x0A for the size of the interesting files (FileInfo, no transfer).
@@ -1559,7 +1583,7 @@ index 19582f3..a3a56e1 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2538,57 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2562,57 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -1617,7 +1641,7 @@ index 19582f3..a3a56e1 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3197,7 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3221,7 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -1625,7 +1649,7 @@ index 19582f3..a3a56e1 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,9 +3344,10 @@ public class HuaweiSupportProvider {
+@@ -2978,9 +3368,10 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -1638,7 +1662,7 @@ index 19582f3..a3a56e1 100644
  
          if (downloadDictTrueSleepData(start, end))
              return true;
-@@ -3014,24 +3381,98 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3405,98 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -1742,10 +1766,11 @@ index 19582f3..a3a56e1 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +3746,29 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +3770,30 @@ public class HuaweiSupportProvider {
      }
  
  }
++
 +
 +
 +
