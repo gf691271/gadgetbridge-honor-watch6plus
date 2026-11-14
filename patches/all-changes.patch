@@ -19,25 +19,42 @@ index e6e6271..78e9ca4 100644
              android:name=".externalevents.GenericWeatherReceiver"
              android:enabled="true"
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/GBApplication.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/GBApplication.java
-index 738777b..bf29578 100644
+index 738777b..53e0a20 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/GBApplication.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/GBApplication.java
-@@ -233,6 +233,14 @@ public class GBApplication extends Application {
-         app = this;
-         super.onCreate();
-         ProcessLifecycleOwner.get().getLifecycle().addObserver(new AppLifecycleObserver());
+@@ -115,6 +115,11 @@ public class GBApplication extends Application {
+ 
+     private static final LimitedQueue<Integer, String> mIDSenderLookup = new LimitedQueue<>(16);
+     private static GBPrefs prefs;
++    /**
++     * Local research patch. SharedPreferences keeps its listeners in a WeakHashMap, so a
++     * listener that nothing else references is garbage collected and silently stops firing.
++     */
++    private static SharedPreferences.OnSharedPreferenceChangeListener periodicSyncPrefListener;
+     /**
+      * Note: is null on Lollipop
+      */
+@@ -237,6 +242,19 @@ public class GBApplication extends Application {
+         sharedPrefs = PreferenceManager.getDefaultSharedPreferences(context);
+         prefs = new GBPrefs(sharedPrefs);
+ 
 +        // Local research patch: arm the periodic watch sync and react to preference changes.
++        // This must run after prefs is assigned: PeriodicSyncScheduler reads the interval
++        // through GBApplication.getPrefs(), and with prefs still null it fell back to the 6h
++        // default on every process start, even when the user had turned the sync off.
 +        final android.content.Context syncCtx = this;
-+        android.preference.PreferenceManager.getDefaultSharedPreferences(this).registerOnSharedPreferenceChangeListener((prefs, key) -> {
++        periodicSyncPrefListener = (changedPrefs, key) -> {
 +            if (nodomain.freeyourgadget.gadgetbridge.externalevents.PeriodicSyncScheduler.PREF_KEY.equals(key)) {
 +                nodomain.freeyourgadget.gadgetbridge.externalevents.PeriodicSyncScheduler.start(syncCtx);
 +            }
-+        });
++        };
++        sharedPrefs.registerOnSharedPreferenceChangeListener(periodicSyncPrefListener);
 +        nodomain.freeyourgadget.gadgetbridge.externalevents.PeriodicSyncScheduler.start(this);
++
+         final boolean environmentSetup = GBEnvironment.isEnvironmentSetup();
  
-         sharedPrefs = PreferenceManager.getDefaultSharedPreferences(context);
-         prefs = new GBPrefs(sharedPrefs);
-@@ -806,3 +814,6 @@ public class GBApplication extends Application {
+         // We need to set up the environment before initializing logging, so that the logging
+@@ -806,3 +824,6 @@ public class GBApplication extends Application {
          }
      }
  }
@@ -91,10 +108,10 @@ index 5bb5f45..abfac1a 100644
  }
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-index 096543c..8df8884 100644
+index 096543c..bec092d 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-@@ -2,82 +2,962 @@ package nodomain.freeyourgadget.gadgetbridge.database
+@@ -2,82 +2,1181 @@ package nodomain.freeyourgadget.gadgetbridge.database
  
  import android.content.Context
  import android.content.Intent
@@ -136,6 +153,13 @@ index 096543c..8df8884 100644
 + *
 + * CSVs are append-only snapshots; raw blobs are content-addressed rewrites under stable
 + * names, so the newest manifest describes the whole archive without duplication.
++ *
++ * Batch rules a consumer can rely on (manifest schema 6):
++ *   - the manifest and every CSV of one run share one stamp (`batch`)
++ *   - the manifest is written last, under a temporary name, and renamed when complete,
++ *     so a visible manifest-<stamp>.json means the whole batch is on disk
++ *   - the delta cursor only moves when every table and the manifest were written
++ *   - dedup keys come from the table's real primary key, not from a hand-kept list
 + * Columns are discovered from the schema at runtime, so adding a table needs one line.
 + * Local research patch: upstream only overwrites a single fixed file.
 + */
@@ -152,6 +176,9 @@ index 096543c..8df8884 100644
 +        val uniqueKey: String = ""
 +    )
 +
++    /** [written] are the CSVs that reached the directory; [failedTables] did not make it. */
++    private data class DeltaResult(val written: List<Written>, val failedTables: List<String>)
++
 +    private data class ColStat(
 +        val name: String,
 +        val sqlType: String,
@@ -163,6 +190,9 @@ index 096543c..8df8884 100644
 +
 +    private data class Written(
 +        val kind: String,
++        val table: String,
++        val primaryKey: List<String>,
++        val keyColumns: List<String>?,
 +        val file: String,
 +        val rows: Int,
 +        val columns: List<String>,
@@ -216,10 +246,23 @@ index 096543c..8df8884 100644
 +                val lastSec = readCursor(CURSOR_DELTA)
 +                val fromSec = if (lastSec == 0L) nowSec - 48 * 3600 else lastSec - 3600
 +
-+                val written = exportDelta(location, fromSec)
++                // One stamp for the whole batch. Calling stamp() per file let the second tick
++                // over in the middle of a run, which split one batch across two stamps.
++                val batch = stamp()
++
++                val delta = exportDelta(location, fromSec, batch)
 +                val raw = copyRawBlobs(location)
-+                writeManifest(location, written, fromSec, nowSec, raw)
-+                writeCursor(CURSOR_DELTA, nowSec)
++                val manifestOk = writeManifest(location, batch, delta, fromSec, nowSec, raw)
++                // Move the cursor only when the batch is complete. The next run starts one
++                // hour before the cursor, so a table that failed here would otherwise lose
++                // every row older than that hour. Repeating a window is harmless: the
++                // consumer deduplicates on the primary key.
++                if (manifestOk && delta.failedTables.isEmpty()) {
++                    writeCursor(CURSOR_DELTA, nowSec)
++                } else {
++                    LOG.warn("Export batch {} incomplete (manifest written={}, failed tables={}); cursor not advanced",
++                        batch, manifestOk, delta.failedTables)
++                }
 +
 +                val lastFull = readCursor(CURSOR_FULL_DB)
 +                if (System.currentTimeMillis() - lastFull >= FULL_DB_EVERY_MS) {
@@ -227,7 +270,7 @@ index 096543c..8df8884 100644
 +                    writeCursor(CURSOR_FULL_DB, System.currentTimeMillis())
 +                    pruneOld(location, "Gadgetbridge-", ".db", KEEP_SNAPSHOTS)
 +                }
-+                pruneOld(location, "manifest-", ".json", KEEP_SNAPSHOTS)
++                pruneBatches(location, batch)
              }
  
 -            GBApplication.getPrefs().preferences.edit {
@@ -254,11 +297,13 @@ index 096543c..8df8884 100644
 -            return
 +    // ---- incremental tables --------------------------------------------------
 +
-+    private fun exportDelta(location: Uri, fromSec: Long): List<Written> {
++    private fun exportDelta(location: Uri, fromSec: Long, batch: String): DeltaResult {
 +        val written = mutableListOf<Written>()
++        val failed = mutableListOf<String>()
 +        GBApplication.acquireDbReadOnly().use { handler ->
 +            val db = handler.database
 +            for (spec in DELTA_TABLES) {
++                var created: Uri? = null
 +                try {
 +                    val all = columnsOf(db, spec.table)
 +                    if (all.isEmpty()) {
@@ -274,8 +319,10 @@ index 096543c..8df8884 100644
 +                    val stats = columnStats(db, spec, usable, whereSql)
 +                    val gaps = mutableListOf<Long>()
 +
-+                    val name = "${spec.kind}-${stamp()}.csv"
++                    val primaryKey = primaryKeyOf(db, spec)
++                    val name = "${spec.kind}-$batch.csv"
 +                    val uri = createDocument(location, name, "text/csv")
++                    created = uri
 +                    var rows = 0
 +                    var prevTs = -1L
 +
@@ -314,7 +361,9 @@ index 096543c..8df8884 100644
 +                                if (spec.timeColumn != null) {
 +                                    val raw = c.getLong(usable.size)
 +                                    ts = if (spec.timeInMs) raw / 1000 else raw
-+                                    if (prevTs >= 0) gaps.add(ts - prevTs)
++                                    // Rows that share a time stamp (activity rows come in
++                                    // pairs) are one sample, not a gap of 0 seconds.
++                                    if (prevTs >= 0 && ts != prevTs) gaps.add(ts - prevTs)
 +                                    prevTs = ts
 +                                }
 +                                w.write(ts.toString()); w.write(","); w.write(isoUtc(ts)); w.write(",")
@@ -333,6 +382,9 @@ index 096543c..8df8884 100644
 +                    val sha = digest.digest().joinToString("") { "%02x".format(it) }
 +                    written += Written(
 +                        kind = spec.kind,
++                        table = spec.table,
++                        primaryKey = primaryKey,
++                        keyColumns = csvKeyColumns(spec, primaryKey),
 +                        file = name,
 +                        rows = rows,
 +                        columns = usable.map { it.first },
@@ -350,10 +402,53 @@ index 096543c..8df8884 100644
 +                    LOG.info("Wrote {} rows x {} cols -> {}", rows, usable.size, name)
 +                } catch (e: Exception) {
 +                    LOG.error("Failed exporting table {}", spec.table, e)
++                    failed += spec.table
++                    // A half-written CSV is in no manifest; remove it so it cannot be mistaken
++                    // for data.
++                    created?.let {
++                        try {
++                            DocumentsContract.deleteDocument(mContext.contentResolver, it)
++                        } catch (cleanup: Exception) {
++                            LOG.warn("Could not remove partial CSV for {}", spec.table, cleanup)
++                        }
++                    }
 +                }
 +            }
 +        }
-+        return written
++        return DeltaResult(written, failed)
++    }
++
++    /**
++     * Primary key columns in key order, read from the schema. A hand-kept list drifts: the
++     * old one gave HUAWEI_ACTIVITY_SAMPLE as (TIMESTAMP, OTHER_TIMESTAMP), but the table key
++     * is (TIMESTAMP, DEVICE_ID, OTHER_TIMESTAMP, SOURCE). [TableSpec.uniqueKey] is only the
++     * fallback for a table that declares no primary key.
++     */
++    private fun primaryKeyOf(db: android.database.sqlite.SQLiteDatabase, spec: TableSpec): List<String> {
++        val cols = mutableListOf<Pair<Int, String>>()
++        try {
++            db.rawQuery("PRAGMA table_info(${spec.table})", null).use { c ->
++                while (c.moveToNext()) {
++                    val position = c.getInt(5)   // 0 = not part of the key, else 1-based order
++                    if (position > 0) cols += position to c.getString(1)
++                }
++            }
++        } catch (e: Exception) {
++            LOG.warn("PRAGMA table_info failed for {}", spec.table, e)
++        }
++        if (cols.isNotEmpty()) return cols.sortedBy { it.first }.map { it.second }
++        return spec.uniqueKey.split('+').map { it.trim() }.filter { it.isNotEmpty() }
++    }
++
++    /**
++     * The same key in CSV column names. The source time column is not in the CSV (epoch_s
++     * replaces it), so it is mapped. Null when that mapping would lose precision, i.e. a
++     * millisecond time column that is part of the key.
++     */
++    private fun csvKeyColumns(spec: TableSpec, primaryKey: List<String>): List<String>? {
++        if (primaryKey.isEmpty()) return null
++        if (spec.timeColumn != null && spec.timeInMs && primaryKey.contains(spec.timeColumn)) return null
++        return primaryKey.map { if (it == spec.timeColumn) "epoch_s" else it }
 +    }
 +
 +    private fun columnsOf(db: android.database.sqlite.SQLiteDatabase, table: String): List<Pair<String, String>> {
@@ -431,19 +526,26 @@ index 096543c..8df8884 100644
 +            Cursor.FIELD_TYPE_BLOB -> ""
 +            else -> {
 +                val s = c.getString(index) ?: ""
-+                if (s.contains(',') || s.contains('"') || s.contains('\n')) {
++                if (s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r')) {
 +                    "\"" + s.replace("\"", "\"\"") + "\""
 +                } else s
 +            }
-+        }
+         }
 +    }
 +
 +    // ---- raw blobs -----------------------------------------------------------
 +
 +    private data class Archived(val uri: Uri, val size: Long)
 +
++    /** One archived blob as the manifest reports it. [bytes] is -1 when the source file is gone. */
++    private data class RawEntry(val name: String, val sha256: String, val bytes: Long, val changed: Boolean)
++
 +    /** [changed] is what this run wrote; [all] is everything the archive holds right now. */
-+    private data class RawArchive(val changed: List<String>, val all: List<String>)
++    private data class RawArchive(
++        val changed: List<String>,
++        val all: List<String>,
++        val entries: List<RawEntry> = emptyList()
++    )
 +
 +    /**
 +     * Copies every Huawei raw blob (whole-night beat-to-beat sleep_data, sleep_state, …)
@@ -460,13 +562,14 @@ index 096543c..8df8884 100644
 +    private fun copyRawBlobs(location: Uri): RawArchive {
 +        val copied = mutableListOf<String>()
 +        val index = mutableMapOf<String, String>()
++        val entries = mutableMapOf<String, RawEntry>()
 +        try {
 +            val root = mContext.getExternalFilesDir(null) ?: return RawArchive(copied, emptyList())
 +            val existing = listDocuments(location)
 +            index.putAll(readArchiveIndex())
 +            val files = root.walkTopDown()
 +                .filter { f ->
-+                    f.isFile && f.length() > 0 &&
++                    f.isFile && f.length() > 0 && f.length() <= MAX_RAW_BYTES &&
 +                        (f.name.endsWith(".bin") ||
 +                            (f.parentFile?.name == "rri" && f.name.endsWith(".csv")) ||
 +                            (f.parentFile?.name == "debugdl" && f.name.endsWith(".log")))
@@ -479,32 +582,49 @@ index 096543c..8df8884 100644
 +            for (f in files) newest[archiveName(f)] = f
 +            var unchanged = 0
 +            for ((target, f) in newest.entries.sortedBy { it.key }) {
-+                val sha = sha256Of(f) ?: continue
++                // Read the file once and hash exactly the bytes that get written. Hashing the
++                // file and then copying it a second time let an append in between (the RRI
++                // csv grows all night) record a checksum the archived copy did not have.
++                val data = try {
++                    f.readBytes()
++                } catch (e: Exception) {
++                    LOG.warn("reading {} failed", f.name, e)
++                    null
++                }
++                if (data == null || data.isEmpty()) continue
++                val sha = sha256Of(data)
 +                // A listing can come back short or empty right after boot; probing the
 +                // document id directly makes the decision independent of that listing.
 +                val current = existing[target] ?: childDocument(location, target)
 +                if (current != null && index[target] == sha) {
 +                    unchanged++
++                    entries[target] = RawEntry(target, sha, data.size.toLong(), false)
 +                    removeDuplicates(location, existing, target)
 +                    continue
 +                }
 +                val uri = if (current != null) {
-+                    overwriteDocument(location, current.uri, f)
++                    overwriteDocument(location, current.uri, data)
 +                } else {
-+                    writeNewDocument(location, target, f)
-+                } ?: continue
++                    writeNewDocument(location, target, data)
++                }
++                if (uri == null) continue
 +                index[target] = sha
 +                copied += target
++                entries[target] = RawEntry(target, sha, data.size.toLong(), true)
 +                removeDuplicates(location, existing, target)
 +            }
 +            removeLegacySnapshots(location, existing, index)
 +            writeArchiveIndex(index)
++            // Blobs archived earlier whose source file no longer exists stay in the list.
++            for ((name, sha) in index) {
++                if (name !in entries) entries[name] = RawEntry(name, sha, -1L, false)
++            }
 +            LOG.info("Archived {} changed raw blobs, {} unchanged ({} candidates)",
 +                copied.size, unchanged, newest.size)
 +        } catch (e: Exception) {
 +            LOG.error("Failed copying raw blobs", e)
 +        }
-+        return RawArchive(copied, index.keys.sorted())
++        return RawArchive(copied, index.keys.sorted(), entries.values.sortedBy { it.name })
 +    }
 +
 +    /** Stable archive name: drop the per-request timestamp from dump snapshot names. */
@@ -536,20 +656,9 @@ index 096543c..8df8884 100644
 +        }
 +    }
 +
-+    private fun sha256Of(f: java.io.File): String? = try {
-+        val md = java.security.MessageDigest.getInstance("SHA-256")
-+        f.inputStream().use { input ->
-+            val buf = ByteArray(64 * 1024)
-+            while (true) {
-+                val n = input.read(buf)
-+                if (n <= 0) break
-+                md.update(buf, 0, n)
-+            }
-+        }
-+        md.digest().joinToString("") { String.format("%02x", it) }
-+    } catch (e: Exception) {
-+        LOG.warn("hashing {} failed", f.name, e); null
-+    }
++    private fun sha256Of(data: ByteArray): String =
++        java.security.MessageDigest.getInstance("SHA-256").digest(data)
++            .joinToString("") { String.format("%02x", it) }
 +
 +    private fun indexFile() = java.io.File(mContext.getExternalFilesDir(null), "export_archive.json")
 +
@@ -565,7 +674,8 @@ index 096543c..8df8884 100644
 +        }
 +        return out
 +    }
-+
+ 
+-        LOG.info("Broadcasting database export success={}", success)
 +    private fun writeArchiveIndex(index: Map<String, String>) {
 +        try {
 +            val o = JsonObject()
@@ -577,7 +687,7 @@ index 096543c..8df8884 100644
 +    }
 +
 +    /** Write [source] into a brand new document, refusing to leave a renamed duplicate behind. */
-+    private fun writeNewDocument(location: Uri, name: String, source: java.io.File): Uri? {
++    private fun writeNewDocument(location: Uri, name: String, data: ByteArray): Uri? {
 +        val uri = try {
 +            createDocument(location, name, "application/octet-stream")
 +        } catch (e: Exception) {
@@ -594,12 +704,12 @@ index 096543c..8df8884 100644
 +                LOG.warn("failed to delete duplicate {}", actual, e)
 +            }
 +            val original = childDocument(location, name) ?: return null
-+            return overwriteDocument(location, original.uri, source)
++            return overwriteDocument(location, original.uri, data)
 +        }
 +        return try {
 +            mContext.contentResolver.openOutputStream(uri).use { out ->
 +                requireNotNull(out) { "no output stream for $name" }
-+                source.inputStream().use { it.copyTo(out) }
++                out.write(data)
 +            }
 +            uri
 +        } catch (e: Exception) {
@@ -608,11 +718,11 @@ index 096543c..8df8884 100644
 +    }
 +
 +    /** Truncate and rewrite an existing document in place. */
-+    private fun overwriteDocument(location: Uri, uri: Uri, source: java.io.File): Uri? {
++    private fun overwriteDocument(location: Uri, uri: Uri, data: ByteArray): Uri? {
 +        try {
 +            mContext.contentResolver.openOutputStream(uri, "wt").use { out ->
 +                requireNotNull(out) { "no truncating output stream for $uri" }
-+                source.inputStream().use { it.copyTo(out) }
++                out.write(data)
 +            }
 +            return uri
 +        } catch (e: Exception) {
@@ -630,7 +740,7 @@ index 096543c..8df8884 100644
 +            ) ?: return null
 +            mContext.contentResolver.openOutputStream(fresh).use { out ->
 +                requireNotNull(out) { "no output stream for $name" }
-+                source.inputStream().use { it.copyTo(out) }
++                out.write(data)
 +            }
 +            fresh
 +        } catch (e: Exception) {
@@ -651,7 +761,10 @@ index 096543c..8df8884 100644
 +            }
 +        }
 +    }
-+
+ 
+-        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
+-        val exportedNotifyIntent = Intent(action)
+-        mContext.sendBroadcast(exportedNotifyIntent)
 +    private fun displayName(uri: Uri): String? = try {
 +        mContext.contentResolver.query(
 +            uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null
@@ -725,16 +838,23 @@ index 096543c..8df8884 100644
 +        return o
 +    }
 +
++    /** Returns true when the manifest reached the export directory. */
 +    private fun writeManifest(
 +        location: Uri,
-+        written: List<Written>,
++        batch: String,
++        delta: DeltaResult,
 +        fromSec: Long,
 +        toSec: Long,
 +        rawCopied: RawArchive
-+    ) {
++    ): Boolean {
 +        try {
++            val written = delta.written
 +            val root = JsonObject()
 +            root.addProperty("schema", SCHEMA_VERSION)
++            // Stamp shared by this manifest and every CSV of the run.
++            root.addProperty("batch", batch)
++            // Batch files (manifest + CSVs) older than this are deleted by the exporter.
++            root.addProperty("retention_days", KEEP_BATCH_DAYS)
 +            root.addProperty("exported_at_utc", isoUtc(System.currentTimeMillis() / 1000))
 +            // Device clock is measured from the SetTime response, which Gadgetbridge
 +            // requests on every connection. If no response was seen in this process,
@@ -764,6 +884,17 @@ index 096543c..8df8884 100644
 +                val f = JsonObject()
 +                f.addProperty("name", w.file)
 +                f.addProperty("kind", w.kind)
++                // Source table and its dedup key. primary_key uses the table's column names,
++                // key_columns the same key in CSV column names (the time column is epoch_s).
++                f.addProperty("table", w.table)
++                val pk = JsonArray()
++                w.primaryKey.forEach { pk.add(it) }
++                f.add("primary_key", pk)
++                w.keyColumns?.let { cols ->
++                    val kc = JsonArray()
++                    cols.forEach { kc.add(it) }
++                    f.add("key_columns", kc)
++                }
 +                f.addProperty("rows", w.rows)
 +                f.addProperty("bytes", w.bytes)
 +                f.addProperty("sha256", w.sha256)
@@ -798,6 +929,12 @@ index 096543c..8df8884 100644
 +            }
 +            root.add("files", files)
 +
++            // Tables that should have been in this batch but failed. The delta cursor was
++            // not advanced, so the next batch covers the same window again.
++            val failedTables = JsonArray()
++            delta.failedTables.forEach { failedTables.add(it) }
++            root.add("failed_tables", failedTables)
++
 +            // raw_files lists the whole archive with stable names, so a consumer that reads
 +            // only the newest manifest still sees every blob that is present. raw_files_new
 +            // says which ones this run actually rewrote (content changed, verified by sha256).
@@ -808,21 +945,36 @@ index 096543c..8df8884 100644
 +            rawCopied.changed.forEach { rawNew.add(it) }
 +            root.add("raw_files_new", rawNew)
 +
-+            // Structured on purpose: downstream consumers dedup on these without parsing prose.
-+            val keys = JsonArray()
-+            fun addKey(table: String, vararg cols: String) {
++            // The same archive with size and checksum, so a consumer can detect a torn read.
++            // sha256 is the checksum of the bytes this exporter wrote. complete = false marks
++            // today's rri / capture file, which the next run can still extend.
++            val today = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
++            val rawArchive = JsonArray()
++            for (e in rawCopied.entries) {
 +                val o = JsonObject()
-+                o.addProperty("table", table)
++                o.addProperty("name", e.name)
++                o.addProperty("sha256", e.sha256)
++                if (e.bytes >= 0) o.addProperty("bytes", e.bytes)
++                o.addProperty("changed", e.changed)
++                val daily = e.name.startsWith("raw-rri_") || e.name.startsWith("raw-capture_")
++                o.addProperty("complete", !(daily && e.name.contains(today)))
++                rawArchive.add(o)
++            }
++            root.add("raw_archive", rawArchive)
++
++            // Structured on purpose: downstream consumers dedup on these without parsing prose.
++            // Kept for older consumers; same information as files[].primary_key, one entry
++            // per exported table, generated from the schema.
++            val keys = JsonArray()
++            for (w in written) {
++                if (w.primaryKey.isEmpty()) continue
++                val o = JsonObject()
++                o.addProperty("table", w.table)
 +                val a = JsonArray()
-+                cols.forEach { a.add(it) }
++                w.primaryKey.forEach { a.add(it) }
 +                o.add("columns", a)
 +                keys.add(o)
 +            }
-+            addKey("HUAWEI_ACTIVITY_SAMPLE", "TIMESTAMP", "OTHER_TIMESTAMP")
-+            addKey("BATTERY_LEVEL", "TIMESTAMP", "BATTERY_INDEX")
-+            addKey("HUAWEI_WORKOUT_DATA_SAMPLE", "WORKOUT_ID", "TIMESTAMP")
-+            addKey("BASE_ACTIVITY_SUMMARY", "_id")
-+            addKey("USER_ATTRIBUTES", "_id")
 +            root.add("unique_keys", keys)
 +
 +            val notes = JsonArray()
@@ -831,17 +983,13 @@ index 096543c..8df8884 100644
 +            notes.add("spo: percent, -1 = not measured; roughly every 5 minutes")
 +            notes.add("heart_rate / resting_heart_rate: bpm, -1 = not measured")
 +            notes.add("nulls: a cell is empty for SQL NULL; -1 is a sentinel meaning 'no data', not a measurement")
-+            notes.add("activity rows come in pairs: same TIMESTAMP with OTHER_TIMESTAMP +/-60s — dedup on both")
++            notes.add("activity rows come in pairs: same TIMESTAMP, different OTHER_TIMESTAMP / SOURCE — dedup on files[].key_columns")
 +            notes.add("file names use local time; timestamps inside files are UTC")
 +            notes.add("raw-*.bin are undecoded Huawei blobs (TruSleep format: zero padding + ACC/PPG records)")
 +            root.add("notes", notes)
 +
-+            val name = "manifest-${stamp()}.json"
-+            val uri = createDocument(location, name, "application/json")
-+            mContext.contentResolver.openOutputStream(uri).use { out ->
-+                requireNotNull(out) { "no output stream for $name" }
-+                OutputStreamWriter(out, Charsets.UTF_8).buffered().use { w -> w.write(root.toString()) }
-+            }
++            val name = "manifest-$batch.json"
++            writeManifestFile(location, name, root.toString())
 +            LOG.info(
 +                "Wrote manifest {} (device_clock source={}, offset_seconds={})",
 +                name,
@@ -849,8 +997,49 @@ index 096543c..8df8884 100644
 +                    ?: DeviceClockTracker.SOURCE_UNAVAILABLE,
 +                DeviceClockTracker.getOffsetSeconds()
 +            )
++            return true
 +        } catch (e: Exception) {
 +            LOG.error("Failed writing manifest", e)
++            return false
++        }
++    }
++
++    /**
++     * A visible manifest tells the consumer that the batch is complete, so it must never be
++     * visible half-written: write it under a temporary name, then rename it. If the provider
++     * cannot rename, fall back to writing the final name directly (the old behaviour).
++     */
++    private fun writeManifestFile(location: Uri, name: String, json: String) {
++        val bytes = json.toByteArray(Charsets.UTF_8)
++        val resolver = mContext.contentResolver
++        var leftover: Uri? = null
++        try {
++            val tmp = createDocument(location, "$name.tmp", "application/octet-stream")
++            leftover = tmp
++            resolver.openOutputStream(tmp).use { out ->
++                requireNotNull(out) { "no output stream for $name.tmp" }
++                out.write(bytes)
++            }
++            val renamed = DocumentsContract.renameDocument(resolver, tmp, name)
++            if (renamed != null) {
++                leftover = renamed
++                if (displayName(renamed) == name) return
++            }
++            LOG.warn("Manifest rename did not produce {}, writing it directly", name)
++        } catch (e: Exception) {
++            LOG.warn("Temporary manifest failed for {}, writing it directly", name, e)
++        }
++        leftover?.let {
++            try {
++                DocumentsContract.deleteDocument(resolver, it)
++            } catch (e: Exception) {
++                LOG.warn("Could not remove temporary manifest for {}", name, e)
++            }
++        }
++        val uri = createDocument(location, name, "application/json")
++        resolver.openOutputStream(uri).use { out ->
++            requireNotNull(out) { "no output stream for $name" }
++            out.write(bytes)
 +        }
 +    }
 +
@@ -906,16 +1095,12 @@ index 096543c..8df8884 100644
 +            }
 +        } catch (e: Exception) {
 +            LOG.warn("user metadata unavailable", e)
-         }
++        }
 +        return o
 +    }
- 
--        LOG.info("Broadcasting database export success={}", success)
++
 +    // ---- full snapshot -------------------------------------------------------
- 
--        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
--        val exportedNotifyIntent = Intent(action)
--        mContext.sendBroadcast(exportedNotifyIntent)
++
 +    private fun exportFullSnapshot(location: Uri) {
 +        val name = "Gadgetbridge-${stamp()}.db"
 +        val uri = createDocument(location, name, "application/octet-stream")
@@ -964,6 +1149,45 @@ index 096543c..8df8884 100644
 +            }
 +        } catch (e: Exception) {
 +            LOG.warn("Failed to prune $prefix entries", e)
++        }
++    }
++
++    /**
++     * Retention for batch files: a manifest or a CSV of one of our kinds whose stamp is older
++     * than KEEP_BATCH_DAYS is deleted. The old rule kept the 7 newest manifests and never
++     * deleted a CSV, so with an export every few hours a consumer that was down for a day
++     * lost batches, while the CSVs piled up without limit. Stale .json.tmp files from an
++     * interrupted run are removed too. Raw blobs and .db snapshots are not touched here.
++     */
++    private fun pruneBatches(location: Uri, currentBatch: String) {
++        try {
++            val cutoff = System.currentTimeMillis() - KEEP_BATCH_DAYS * 24L * 60 * 60 * 1000
++            val parser = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
++            val kinds = DELTA_TABLES.joinToString("|") { Regex.escape(it.kind) }
++            val batchFile = Regex("^(?:manifest|$kinds)-(\\d{8}-\\d{6})\\.(?:json|csv)$")
++            for ((name, doc) in listDocuments(location)) {
++                val staleTmp = name.endsWith(".json.tmp") && name != "manifest-$currentBatch.json.tmp"
++                val stampText = batchFile.matchEntire(name)?.groupValues?.get(1)
++                val expired = if (stampText == null || stampText == currentBatch) {
++                    false
++                } else {
++                    val time = try {
++                        parser.parse(stampText)?.time
++                    } catch (e: Exception) {
++                        null
++                    }
++                    time != null && time < cutoff
++                }
++                if (!staleTmp && !expired) continue
++                try {
++                    DocumentsContract.deleteDocument(mContext.contentResolver, doc.uri)
++                    LOG.info("Pruned {}", name)
++                } catch (e: Exception) {
++                    LOG.warn("Failed to prune {}", name, e)
++                }
++            }
++        } catch (e: Exception) {
++            LOG.warn("Failed to prune batch files", e)
 +        }
 +    }
 +
@@ -1036,8 +1260,17 @@ index 096543c..8df8884 100644
      companion object {
          private val LOG: Logger = LoggerFactory.getLogger(DatabaseExportWorker::class.java)
  
-+        private const val SCHEMA_VERSION = 5
-+        private const val KEEP_SNAPSHOTS = 7
++        private const val SCHEMA_VERSION = 6
++        /**
++         * Full .db snapshots to keep. Matches [KEEP_BATCH_DAYS] so the snapshot is still
++         * there for a consumer that missed the CSV batches: the snapshot holds every row,
++         * the batches only the deltas.
++         */
++        private const val KEEP_SNAPSHOTS = 14
++        /** Manifests and CSVs older than this many days are deleted from the export directory. */
++        private const val KEEP_BATCH_DAYS = 14
++        /** Raw files above this size are not archived (they are read into memory to be hashed). */
++        private const val MAX_RAW_BYTES = 32L * 1024 * 1024
 +        private const val FULL_DB_EVERY_MS = 24L * 60 * 60 * 1000
 +        private const val CURSOR_FULL_DB = "last_full_db_ms"
 +        private const val CURSOR_DELTA = "last_delta_sec"
@@ -1046,15 +1279,17 @@ index 096543c..8df8884 100644
 +        /**
 +         * Every table exported incrementally. Columns are discovered at runtime.
 +         * timeColumn = null means the table has no timestamp: it is exported whole each run.
++         * uniqueKey is only a fallback: the manifest takes the key from PRAGMA table_info.
 +         */
 +        private val DELTA_TABLES = listOf(
 +            TableSpec("activity", "HUAWEI_ACTIVITY_SAMPLE", "TIMESTAMP",
-+                uniqueKey = "TIMESTAMP+OTHER_TIMESTAMP"),
-+            TableSpec("battery", "BATTERY_LEVEL", "TIMESTAMP", uniqueKey = "TIMESTAMP+BATTERY_INDEX"),
++                uniqueKey = "TIMESTAMP+DEVICE_ID+OTHER_TIMESTAMP+SOURCE"),
++            TableSpec("battery", "BATTERY_LEVEL", "TIMESTAMP",
++                uniqueKey = "TIMESTAMP+DEVICE_ID+BATTERY_INDEX"),
 +            TableSpec("workout-sample", "HUAWEI_WORKOUT_DATA_SAMPLE", "TIMESTAMP",
 +                uniqueKey = "WORKOUT_ID+TIMESTAMP"),
 +            TableSpec("workout-summary", "HUAWEI_WORKOUT_SUMMARY_SAMPLE", "START_TIMESTAMP",
-+                uniqueKey = "_id"),
++                uniqueKey = "WORKOUT_ID"),
 +            // START_TIME is in epoch milliseconds, unlike the sample tables
 +            TableSpec("workout-base", "BASE_ACTIVITY_SUMMARY", "START_TIME", timeInMs = true,
 +                uniqueKey = "_id"),
@@ -1062,7 +1297,8 @@ index 096543c..8df8884 100644
 +            TableSpec("user-attributes", "USER_ATTRIBUTES", "VALID_FROM_UTC", timeInMs = true,
 +                uniqueKey = "_id"),
 +            // no timestamp column at all: exported whole, every run
-+            TableSpec("workout-pace", "HUAWEI_WORKOUT_PACE_SAMPLE", null, uniqueKey = "WORKOUT_ID+POINT_INDEX"),
++            TableSpec("workout-pace", "HUAWEI_WORKOUT_PACE_SAMPLE", null,
++                uniqueKey = "WORKOUT_ID+PACE_INDEX+DISTANCE+TYPE"),
 +            TableSpec("device-attributes", "DEVICE_ATTRIBUTES", "VALID_FROM_UTC", timeInMs = true,
 +                uniqueKey = "_id"),
 +        )
@@ -1469,7 +1705,7 @@ index 583c919..871d58f 100644
                          // Nothing to download, go to end
                          fileComplete();
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..8dcda70 100644
+index 19582f3..57a51b7 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -1488,7 +1724,7 @@ index 19582f3..8dcda70 100644
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGpsDataRequest;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFileUploadInfo;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHeartRateZonesConfig;
-@@ -281,6 +283,350 @@ public class HuaweiSupportProvider {
+@@ -281,6 +283,405 @@ public class HuaweiSupportProvider {
      private boolean gpsEnabled = false;
      private Location gpsLastLocation;
  
@@ -1509,6 +1745,18 @@ index 19582f3..8dcda70 100644
 +        int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
 +        return hour >= RRI_WINDOW_START_HOUR && hour < RRI_WINDOW_END_HOUR;
 +    }
++
++    /**
++     * Research scaffold switch. When true, every sync asks the device for all 17 known file
++     * ids and throws the answers away (only the size is logged). That list contains
++     * sleep_state.bin, sleep_data.bin and rrisqi_data.bin, so the real data is downloaded a
++     * second time ahead of the archive and parse requests, and the device has to answer
++     * 14 more requests with an error or with size 0. Keep it off while collecting data.
++     */
++    private static final boolean RESEARCH_FILE_PROBES = false;
++
++    /** How many sleep_data dumps stay in files/dump. The export only reads the newest one. */
++    private static final int KEEP_SLEEP_DUMPS = 5;
 +
 +    /** Wall-clock time of the last 0x19/0x05 packet, i.e. proof that the stream is live. */
 +    private static volatile long lastRriPacketMs = 0L;
@@ -1769,17 +2017,18 @@ index 19582f3..8dcda70 100644
 +                            @Override
 +                            public void downloadComplete(HuaweiFileDownloadManager.FileRequest fr, @Nullable File raw) {
 +                                byte[] data = fr.getData();
++                                if (data == null || data.length == 0) {
++                                    // Size 0 means the device had nothing for this window.
++                                    // An empty file must not replace the previous good dump.
++                                    LOG.info("FULLDUMP sleep_data empty, nothing saved");
++                                    return;
++                                }
 +                                LOG.info("FULLDUMP sleep_data bytes={}", data.length);
 +                                try {
 +                                    java.io.File dir = new java.io.File(
 +                                            getContext().getExternalFilesDir(null), "dump");
 +                                    if (!dir.exists()) dir.mkdirs();
-+                                    java.io.File out = new java.io.File(dir, "sleep_data_"
-+                                            + System.currentTimeMillis() + ".bin");
-+                                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
-+                                        fos.write(data);
-+                                    }
-+                                    LOG.info("FULLDUMP saved {}", out.getAbsolutePath());
++                                    saveSleepDump(dir, data);
 +                                } catch (Exception e) {
 +                                    LOG.error("FULLDUMP save failed", e);
 +                                }
@@ -1791,6 +2040,48 @@ index 19582f3..8dcda70 100644
 +                            }
 +                        }), false);
 +        LOG.info("FULLDUMP requested {} -> {}", start, end);
++    }
++
++    /**
++     * Save one whole-window dump, unless it is byte-identical to the newest dump on disk,
++     * then delete all but the newest KEEP_SLEEP_DUMPS files. Every sync requests the same
++     * 48h window, so without this the folder gains one ~100 KB copy per sync, forever.
++     */
++    private void saveSleepDump(java.io.File dir, byte[] data) throws IOException {
++        java.io.File[] old = dir.listFiles(
++                (d, name) -> name.startsWith("sleep_data_") && name.endsWith(".bin"));
++        if (old == null) {
++            old = new java.io.File[0];
++        }
++        java.util.Arrays.sort(old, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
++        if (old.length > 0 && old[0].length() == data.length) {
++            byte[] previous = new byte[data.length];
++            int read = 0;
++            try (java.io.FileInputStream in = new java.io.FileInputStream(old[0])) {
++                while (read < previous.length) {
++                    int n = in.read(previous, read, previous.length - read);
++                    if (n < 0) {
++                        break;
++                    }
++                    read += n;
++                }
++            }
++            if (read == previous.length && java.util.Arrays.equals(previous, data)) {
++                LOG.info("FULLDUMP unchanged since {}, not saved again", old[0].getName());
++                return;
++            }
++        }
++        java.io.File out = new java.io.File(dir, "sleep_data_" + System.currentTimeMillis() + ".bin");
++        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
++            fos.write(data);
++        }
++        LOG.info("FULLDUMP saved {}", out.getAbsolutePath());
++        // The new file plus the newest KEEP_SLEEP_DUMPS - 1 old ones stay.
++        for (int i = Math.max(0, KEEP_SLEEP_DUMPS - 1); i < old.length; i++) {
++            if (!old[i].delete()) {
++                LOG.warn("FULLDUMP could not delete old dump {}", old[i].getName());
++            }
++        }
 +    }
 +
 +    // ---- Local research patch: brute-force file-type ids ----------------------
@@ -1839,7 +2130,7 @@ index 19582f3..8dcda70 100644
      private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
  
      protected ResponseManager responseManager = new ResponseManager(this);
-@@ -817,6 +1163,18 @@ public class HuaweiSupportProvider {
+@@ -817,6 +1218,18 @@ public class HuaweiSupportProvider {
              huaweiDataSyncManager.unregisterAll();
              this.huaweiDataSyncTreeCircleGoals = null;
              stopBatteryRunnerDelayed();
@@ -1858,20 +2149,21 @@ index 19582f3..8dcda70 100644
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +1974,53 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +2029,49 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
-+        // Local research patch: probe every known file id on each sync, unconditionally.
-+        // The TruSleep-gated path never runs on devices whose capability bits are unknown.
-+        try {
-+            int end = (int) (System.currentTimeMillis() / 1000L);
-+            // Local patch: the watchdog tends to answer wide windows with an empty result;
-+            // 48h is the window that actually returned data during the type sweep.
-+            int start = end - 48 * 3600;
-+            enqueueProbeDownloads(start, end);
-+        } catch (Exception e) {
-+            LOG.error("Probe enqueue failed", e);
++        // Local research patch: probe every known file id. Off by default, because the sweep
++        // re-downloads the real sleep files and discards them (see RESEARCH_FILE_PROBES).
++        if (RESEARCH_FILE_PROBES) {
++            try {
++                int end = (int) (System.currentTimeMillis() / 1000L);
++                // 48h is the window that actually returned data during the type sweep.
++                int start = end - 48 * 3600;
++                enqueueProbeDownloads(start, end);
++            } catch (Exception e) {
++                LOG.error("Probe enqueue failed", e);
++            }
 +        }
 +        // Local patch: archive the raw sleep blob on every sync, not only on connect.
 +        enqueueFullSleepDump();
@@ -1899,12 +2191,7 @@ index 19582f3..8dcda70 100644
 +        // Local patch: download a few interesting files discovered via the 0x0A list.
 +        // probeDebugDownloads();  // 已停用：0x0A 干扰下载会话        // Local patch: ask for the 0x0A debug file list once per sync.
 +        // If the watch answers, we learn which files exist instead of guessing type bytes.
-+        try {
-+            // 已停用：0x0A 探针干扰下载会话
-+            LOG.info("DEBUG_FILELIST requested");
-+        } catch (Exception e) {
-+            LOG.error("DEBUG_FILELIST failed", e);
-+        }        // 研究期补丁已停用：RRI 实时流保活会持续点亮 PPG（耗手表电），
++        // 已停用：0x0A 探针干扰下载会话（不再打印 "DEBUG_FILELIST requested"，因为并没有发请求）        // 研究期补丁已停用：RRI 实时流保活会持续点亮 PPG（耗手表电），
 +        // 整晚逐拍数据从 sleep_data.bin 的 48h 窗口同步即可拿到。
 +        // openRriStream();
 +        // startTypeProbe();
@@ -1912,7 +2199,7 @@ index 19582f3..8dcda70 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2629,57 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2680,66 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -1920,20 +2207,29 @@ index 19582f3..8dcda70 100644
 +    private final android.os.Handler busyWatchdog = new android.os.Handler(android.os.Looper.getMainLooper());
 +    private final Runnable busyCheck = new Runnable() {
 +        private int stuckMinutes = 0;
++        private String stuckTask = null;
 +
 +        @Override
 +        public void run() {
 +            try {
 +                if (gbDevice != null && gbDevice.isBusy()) {
++                    String task = gbDevice.getBusyTask();
++                    if (task == null || !task.equals(stuckTask)) {
++                        // Another task holds the flag now, so the previous one did finish.
++                        stuckTask = task;
++                        stuckMinutes = 0;
++                    }
 +                    stuckMinutes++;
 +                    LOG.info("BUSY_WATCHDOG task={} minutes={}", gbDevice.getBusyTask(), stuckMinutes);
 +                    if (stuckMinutes >= 10) {
 +                        LOG.error("BUSY_WATCHDOG clearing stuck task {}", gbDevice.getBusyTask());
 +                        gbDevice.unsetBusyTask();
 +                        stuckMinutes = 0;
++                        stuckTask = null;
 +                    }
 +                } else {
 +                    stuckMinutes = 0;
++                    stuckTask = null;
 +                }
 +            } catch (Exception e) {
 +                LOG.error("BUSY_WATCHDOG failed", e);
@@ -1970,15 +2266,18 @@ index 19582f3..8dcda70 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3288,7 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3348,10 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
 +        rriHandler.removeCallbacks(rriRepeat);
++        // These two kept running on a disposed provider, one more copy per reconnect.
++        busyWatchdog.removeCallbacks(busyCheck);
++        probeHandler.removeCallbacks(probeStep);
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,9 +3435,10 @@ public class HuaweiSupportProvider {
+@@ -2978,9 +3498,10 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -1991,7 +2290,7 @@ index 19582f3..8dcda70 100644
  
          if (downloadDictTrueSleepData(start, end))
              return true;
-@@ -3014,24 +3472,98 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3535,98 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -2095,7 +2394,7 @@ index 19582f3..8dcda70 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +3837,30 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +3900,30 @@ public class HuaweiSupportProvider {
      }
  
  }
@@ -2127,7 +2426,7 @@ index 19582f3..8dcda70 100644
 +
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
-index 448962a..ed2dda1 100644
+index 448962a..21635b0 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
 @@ -41,6 +41,12 @@ public class ResponseManager {
@@ -2294,7 +2593,7 @@ index 448962a..ed2dda1 100644
                  if (handler == null) {
                      if (LOG.isDebugEnabled()) {
                          LOG.debug("Service: {}, command: {}, asynchronous response.", Integer.toHexString(receivedPacket.serviceId & 0xff), Integer.toHexString(receivedPacket.commandId & 0xff));
-@@ -167,4 +317,62 @@ public class ResponseManager {
+@@ -167,4 +317,81 @@ public class ResponseManager {
              }
          } while (left > 0);
      }
@@ -2302,7 +2601,11 @@ index 448962a..ed2dda1 100644
 +    /**
 +     * Local research patch: append decoded RRI/SQI pairs to a daily CSV so overnight
 +     * beat-to-beat data survives without a computer attached.
-+     * Layout: data/rri/rri_YYYYMMDD.csv with rows {@code epoch_ms,rri_ms,sqi}.
++     * Layout: files/rri/rri_YYYYMMDD.csv with rows {@code epoch_s,rri_ms,sqi}.
++     * epoch_s is the packet time stamp from the device, so all beats of one packet (about
++     * 14) share it; the order of the rows inside a packet is the beat order.
++     * Beats with sqi 0 are kept: dropping them would break the beat sequence, and the
++     * consumer can filter on the sqi column.
 +     */
 +    private static void appendRriToFile(byte[] raw) {
 +        try {
@@ -2312,8 +2615,23 @@ index 448962a..ed2dda1 100644
 +            int i = 0;
 +            while (i + 2 <= raw.length) {
 +                int tag = raw[i] & 0xFF;
-+                int len = raw[i + 1] & 0xFF;
-+                int start = i + 2;
++                // The length is a VarInt (7 bits per byte, high bit = more bytes follow), the
++                // same as HuaweiTLV. A container of 128 bytes or more (15+ records) needs two
++                // length bytes; reading only one byte made the parser drop the whole packet.
++                int p = i + 1;
++                int len = 0;
++                int b = 0;
++                boolean truncated = false;
++                do {
++                    if (p >= raw.length) {
++                        truncated = true;
++                        break;
++                    }
++                    b = raw[p++] & 0xFF;
++                    len = (len << 7) | (b & 0x7F);
++                } while ((b & 0x80) != 0);
++                if (truncated) break;
++                int start = p;
 +                int end = start + len;
 +                if (end > raw.length) break;
 +                if (tag == 0x82 || tag == 0x83) {
@@ -2327,7 +2645,7 @@ index 448962a..ed2dda1 100644
 +                    curRri = ((raw[start] & 0xFF) << 8) | (raw[start + 1] & 0xFF);
 +                } else if (tag == 0x05 && len == 1) {
 +                    int sqi = raw[start] & 0xFF;
-+                    if (curRri > 0 && sqi > 0) pairs.add(new int[]{curRri, sqi});
++                    if (curRri > 0) pairs.add(new int[]{curRri, sqi});
 +                    curRri = -1;
 +                }
 +                i = end;

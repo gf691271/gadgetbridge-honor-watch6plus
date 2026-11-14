@@ -26,7 +26,11 @@ def load(path: Path):
                 continue
             if 250 <= rri <= 2500 and sqi > 0:
                 rows.append((ts, rri, sqi))
-    rows.sort()
+    # Sort on the packet time stamp only. Python's sort is stable, so the beats of one
+    # packet (about 14 rows that share one epoch_s) keep their file order. A plain
+    # rows.sort() also ordered them by rri_ms inside each packet, which turned every
+    # packet into a rising ramp and made RMSSD / pNN50 meaningless.
+    rows.sort(key=lambda r: r[0])
     return rows
 
 

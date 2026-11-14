@@ -17,7 +17,7 @@
 | 固件 | `20.1.0.114` |
 | 手机 | HONOR Magic V6 `PNM-AN20`，Android 17 / SDK 37（MagicOS） |
 | 连接方式 | BR/EDR RFCOMM（**不是 BLE**） |
-| Gadgetbridge | 0.95.1（versionCode 255），上游快照 2026-11-01 |
+| Gadgetbridge | 0.95.1（versionCode 255），上游 `master` 的提交 `6a322305`（2026-10-31） |
 
 **固件版本很关键。** 下面的协议结论都是针对 `20.1.0.114` 得出的；固件不同，
 服务与命令集可能不同。[`docs/reproduction.md`](docs/reproduction.md) 说明了怎么判断。
@@ -27,10 +27,12 @@
 ## 五步开始
 
 ```powershell
-# 1. 取对应版本的上游源码
+# 1. 取上游源码，切到精确的基线提交。
+#    不要用 0.95.1 这个 tag：补丁是从三周后的 master 切出来的，
+#    在 tag 上 arrays.xml / strings.xml 套不上。
 git clone https://codeberg.org/Freeyourgadget/Gadgetbridge.git
 cd Gadgetbridge
-git checkout <0.95.1 对应的提交>
+git checkout 6a322305eae857436e77b3a0f5b3ebc438b047e9
 
 # 2. 打补丁
 git apply --check /path/to/patches/all-changes.patch
@@ -71,11 +73,15 @@ tools\install-gb.ps1
 导出结构（由打过补丁的自动导出 Worker 写到用户通过 SAF 选的目录）：
 
 ```
-manifest-<yyyyMMdd-HHmmss>.json    schema、每文件列字典、质量指标、校验和
-<kind>-<yyyyMMdd-HHmmss>.csv       单表增量行
-raw-sleep_data_<epoch_ms>.bin      未解码的 TruSleep 原始数据
+manifest-<yyyyMMdd-HHmmss>.json    schema 6：最后落盘；每文件的表名、去重键、列字典、校验和
+<kind>-<yyyyMMdd-HHmmss>.csv       单表增量行（时间戳与同批 manifest 相同）
+raw-sleep_data.bin                 未解码的 TruSleep 原始数据，稳定文件名，内容变了才重写
+raw-rri_<yyyyMMdd>.csv             逐拍心跳流，一天一个文件
+raw-capture_<yyyyMMdd>.csv         采集状态时间线（开流 / 关流 / 会话开始）
 Gadgetbridge-<yyyyMMdd-HHmmss>.db  每日全量快照（可选）
 ```
+
+超过 14 天的 manifest 和 CSV 由导出端自己删除；下游程序在这个目录里只读，不写、不删。
 
 **下游程序只需要读这个目录**，不要 import Gadgetbridge 的任何类——
 文件布局就是契约。
@@ -120,6 +126,7 @@ Gadgetbridge 一直显示"认证中"，日志里是
 | [`docs/pipeline.md`](docs/pipeline.md) | 分析流水线 |
 | [`docs/apnea-analysis.md`](docs/apnea-analysis.md) | 呼吸相关指标的定义与阈值 |
 | [`docs/next-steps.md`](docs/next-steps.md) | 未完成事项 |
+| [`docs/review-2026-11-14.md`](docs/review-2026-11-14.md) | 补丁代码评审：已修的问题、还要在真机上确认的问题 |
 
 ---
 
@@ -141,4 +148,4 @@ decoders/   Python：逐拍解析、CVHR 与心率骤升分析
 - **与 Gadgetbridge 项目无关。** 这里的补丁是本地研究改动，不以这个形态提交上游。
 - **单设备验证。** 只有一块手表、一台手机验证过。固件不同可能行为不同——
   `docs/reproduction.md` 里的验收步骤就是为了尽早发现这种差异。
-- Gadgetbridge 是 AGPL-3.0。本仓库的补丁属于衍生作品，采用同样的许可证。
+- Gadgetbridge 是 AGPL-3.0。本仓库的补丁属于衍生作品，采用同样的许可证（见 [`LICENSE`](LICENSE)）。

@@ -1,4 +1,12 @@
-# 数据管线说明（稳定版）
+# 数据管线说明（历史版本，已被取代）
+
+> **这份文档描述的是 2026-11 上旬的旧管线**：Gadgetbridge 每 3 小时导出整库 `.db`，电脑用 `adb pull`
+> 拉取再分析。文中的 `sync.py`、`report.py`、`GBSyncTask` 都不在本仓库里，「已知缺口」一节说的
+> 「心率 / 血氧无」也已经过时（见 [`protocol-findings.md`](protocol-findings.md) 第 8 节）。
+>
+> 现在的管线是：打过补丁的自动导出 Worker 把 manifest + CSV + raw 文件写到 SAF 目录，下游只读这个目录。
+> 文件契约见 [`patches.md`](patches.md) 和 mailuo 仓库的 `docs/integrations/gadgetbridge.md`。
+> 这里只保留第 4 节「数据结构要点」还有参考价值。
 
 目标：把荣耀手表 6 Plus 的数据**稳定、自动**地落到这台电脑上，并生成结构化结果。
 

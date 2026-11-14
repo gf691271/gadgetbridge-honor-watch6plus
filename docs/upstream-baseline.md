@@ -8,10 +8,24 @@
 | versionCode | 255 |
 | 源码快照时间 | 2026-11-01 |
 | 上游主仓 | https://codeberg.org/Freeyourgadget/Gadgetbridge |
-| GitHub 镜像 | https://github.com/Freeyourgadget/Gadgetbridge |
+| GitHub 镜像 | https://github.com/Freeyourgadget/Gadgetbridge（2026-11 时只同步到 0.83.0，不能用来取基线） |
+| **基线提交** | **`6a322305eae857436e77b3a0f5b3ebc438b047e9`**（上游 `master`，2026-10-31，"Zepp OS: Enable HRV if BioCharge app is available"） |
 
-本地源码树没有 git 元数据（是压缩包解压的），所以**没有精确 commit**。
-要精确复现，用版本号 0.95.1 去 upstream 打 tag。
+**不要用 `0.95.1` 这个 tag 当基线。** tag 打在 2026-10-09（`97d03b78`），补丁是从三周后的
+master 快照切出来的。在 tag 上 `git apply --check` 会失败：
+
+```
+error: patch failed: app/src/main/res/values/arrays.xml:4989
+error: patch failed: app/src/main/res/values/strings.xml:6606
+```
+
+基线是这样定位的（2026-11-14 评审）：`all-changes.patch` 每个文件的 `index <旧 blob>..<新 blob>`
+行记录了打补丁前的文件哈希。把上游 master 2026-10-05 之后的 1200 个提交逐个比对，15 个被修改文件的
+blob 全部吻合的只有 `7fcbc3a6`（10-26）到 `6a322305`（10-31）这 11 个连续提交，取最新的一个。
+在它上面 `git apply --check patches/all-changes.patch` 通过，`git am patches/0001-*.patch patches/0002-*.patch`
+得到的源码树与 `all-changes.patch` 逐字节一致。
+
+（原来这里写的是「本地源码树没有 git 元数据，所以没有精确 commit」。现在有了，以上面这个提交为准。）
 
 ---
 
