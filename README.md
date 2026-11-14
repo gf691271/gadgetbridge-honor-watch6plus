@@ -115,10 +115,15 @@ Gadgetbridge sits at "authenticating" indefinitely while the log shows
 Restarting the watch clears it immediately — no re-pairing, no reinstall.
 
 **3. A probe can consume a file before the archiver sees it.**
-
 The watch hands out each data file once. If a diagnostic request for
 `sleep_data.bin` runs before the archive path, the archive gets zero bytes.
 Exactly one consumer may request a given file.
+
+Measured on 2026-11-14, after the probe sweep was switched off: this applies to the
+**0x0A** path only. Over 0x2C the watch hands the same `sleep_data.bin` out again on
+every sync (105716 bytes at 23:36:18, 23:36:25 and 23:36:28 of one connection), so a
+lost 0x2C download is recoverable — waiting one sync is enough. The rule above stays
+in place because it costs nothing to keep.
 
 ---
 
