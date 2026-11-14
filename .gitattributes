@@ -1,0 +1,12 @@
+# Patches must keep their exact bytes: a CRLF rewrite makes `git apply` fail and
+# silently changes the diff context. Never let Git touch these.
+*.patch -text
+*.patch eol=lf
+
+# Bash / PowerShell helpers and docs: normalise to LF in the repository so the
+# patches above stay byte-stable and the docs render the same everywhere.
+*.ps1 text eol=crlf
+*.sh text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.json text eol=lf
