@@ -19,7 +19,7 @@ rebuild the same environment.
 | Firmware | `20.1.0.114` |
 | Phone | HONOR Magic V6 `PNM-AN20`, Android 17 / SDK 37 (MagicOS) |
 | Transport | BR/EDR RFCOMM — **not BLE** |
-| Gadgetbridge | 0.95.1 (versionCode 255), upstream snapshot 2026-11-01 |
+| Gadgetbridge | 0.95.1 (versionCode 255), upstream `master` at commit `6a322305` (2026-10-31) |
 
 Firmware matters. The protocol findings below were established against
 `20.1.0.114`; a different firmware may expose a different service and command
@@ -30,10 +30,12 @@ set. [`docs/reproduction.md`](docs/reproduction.md) explains how to tell.
 ## Quick start
 
 ```powershell
-# 1. Get upstream at the matching version
+# 1. Get upstream at the exact baseline commit.
+#    Do NOT use the 0.95.1 tag: the patch set was cut from master three weeks later,
+#    and arrays.xml / strings.xml do not apply on the tag.
 git clone https://codeberg.org/Freeyourgadget/Gadgetbridge.git
 cd Gadgetbridge
-git checkout <commit for 0.95.1>
+git checkout 6a322305eae857436e77b3a0f5b3ebc438b047e9
 
 # 2. Apply the patches
 git apply --check /path/to/patches/all-changes.patch
@@ -77,11 +79,16 @@ Export layout (written by the patched auto-export worker, to a directory the
 user picks through SAF):
 
 ```
-manifest-<yyyyMMdd-HHmmss>.json    schema, per-file column dictionary, quality, checksums
-<kind>-<yyyyMMdd-HHmmss>.csv       incremental rows for one table
-raw-sleep_data_<epoch_ms>.bin      undecoded TruSleep blob
+manifest-<yyyyMMdd-HHmmss>.json    schema 6: written last; per-file table, key, column dictionary, checksums
+<kind>-<yyyyMMdd-HHmmss>.csv       incremental rows for one table (same stamp as its manifest)
+raw-sleep_data.bin                 undecoded TruSleep blob, stable name, rewritten when it changes
+raw-rri_<yyyyMMdd>.csv             beat-to-beat stream, one file per day
+raw-capture_<yyyyMMdd>.csv         capture timeline (stream opened / closed / session start)
 Gadgetbridge-<yyyyMMdd-HHmmss>.db  daily full snapshot (optional)
 ```
+
+Manifests and CSVs older than 14 days are deleted by the exporter; the consumer
+must never delete or write anything in this directory.
 
 A downstream program only needs to read this directory. It must not import
 Gadgetbridge classes — the file layout is the contract.
@@ -128,6 +135,7 @@ Exactly one consumer may request a given file.
 | [`docs/pipeline.md`](docs/pipeline.md) | Analysis pipeline |
 | [`docs/apnea-analysis.md`](docs/apnea-analysis.md) | Definitions and thresholds for the breathing-related metrics |
 | [`docs/next-steps.md`](docs/next-steps.md) | Open work |
+| [`docs/review-2026-11-14.md`](docs/review-2026-11-14.md) | Code review of the patch set: what was fixed, what still needs the watch |
 
 The documents themselves are written in Chinese; the protocol tables, code and
 commands in them are language-independent. An English translation is welcome as
@@ -157,4 +165,4 @@ decoders/   Python: TruSleep beat parser, CVHR and heart-rate surge analysis
   firmware may behave differently — the acceptance test in
   `docs/reproduction.md` is there to detect that early.
 - Gadgetbridge is AGPL-3.0. Patches in this repository are derivative work and
-  carry the same licence. Nothing here is copied from another project.
+  carry the same licence (see [`LICENSE`](LICENSE)). Nothing here is copied from another project.

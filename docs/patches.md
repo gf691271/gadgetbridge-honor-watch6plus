@@ -1,10 +1,12 @@
 # 补丁清单
 
-合集：`patches/all-changes.patch`（27 个文件，+3049 / -87）
+合集：`patches/all-changes.patch`（27 个文件，+3355 / -87）
 应用：`git apply patches/all-changes.patch`
-按提交拆分的版本：`patches/0001-local-research-patches-for-HONOR-Watch-6-Plus-GB-0.9.patch`
+按提交拆分的版本：`patches/0001-*.patch`（5 个提交）+ `patches/0002-*.patch`（2026-11-14 评审修复，1 个提交），
+用 `git am` 按顺序套，结果与合集逐字节一致。
 
-已用 `git apply --check` 在上游 2026-11-01 快照上验证可干净套用。
+基线是上游 `master` 的提交 `6a322305eae857436e77b3a0f5b3ebc438b047e9`（不是 `0.95.1` tag，见
+[`upstream-baseline.md`](upstream-baseline.md)）。已在这个提交上验证 `git apply --check` 通过。
 
 每个条目都标了 **生产必需** 还是 **研究脚手架**。
 升级上游时，把「研究脚手架」全部删掉再重新实现。
@@ -21,8 +23,9 @@
 - manifest 带 `column_dictionary`（类型/非空数/基数/范围）、`data_quality`、
   `unique_keys`、`row_time_base`、`file_name_timezone`
 - 游标存在 `<extFiles>/export_state.txt`（**不要用 SharedPreferences，Worker 里写不进去**）
-- 完成后发广播（也 `setPackage("com.example.consumer")`）
-- 常量：`SCHEMA_VERSION=5`（见下文 2026-11-14 的归档改造）、`KEEP_SNAPSHOTS=7`、`FULL_DB_EVERY_MS=24h`
+- 完成后发广播（也 `setPackage("com.evolve.mailuo")`，常量 `CONSUMER_PACKAGE`）
+- 常量：`SCHEMA_VERSION=6`（见文末「2026-11-14 评审修复」）、`KEEP_SNAPSHOTS=7`（只管 `.db` 快照）、
+  `KEEP_BATCH_DAYS=14`（manifest 和 CSV）、`FULL_DB_EVERY_MS=24h`
 
 **踩过的坑**：早期用 SharedPreferences 存游标，Worker 进程里写入不生效，
 导致每次全量重导。
@@ -68,6 +71,7 @@ Math.floorDiv(now - anchor, interval) + 1   // 算下一次触发
 | `requests/Send0ABlockSizeProbe.java` | 0x0A 全序列 init→params→block | ❌ 已停用（29 次以上，0x05 零返回） |
 | `requests/SendUnknownServiceProbeRequest.java` | 探测设备支持但 GB 未实现的服务 | ❌ 已停用（返回错误码 100003/100007） |
 | `service/devices/huawei/HuaweiSupportProvider.java` 里的 `probe*()` 方法 | 上述探针的入口 | 全部注释掉 |
+| `HuaweiSupportProvider.enqueueProbeDownloads()` | 每次同步用 0x2C 把 17 个文件 id 全请求一遍，只打日志、丢弃数据 | ❌ 2026-11-14 评审时发现**仍在每次同步里无条件运行**，已用 `RESEARCH_FILE_PROBES = false` 关掉（见文末） |
 | `service/devices/huawei/ResponseManager.java` 里的 `HRRRI_RAW` / `FILEDL0A_RAW` / `BLOCKACK` 等日志 | 抓原始包 | 保留无害，但会刷屏 |
 
 **唯一要保留的「脚手架」**：
@@ -217,4 +221,35 @@ manifest 因此升到 **schema = 5**：新增 `raw_files`（当前归档全集�
 `init → params → block` 全序列跑过 29 次以上，`0x0A/0x05` 一包都没回来；
 而 0x0A 请求有可能被 0x2C 下载会话误认领，把那次同步整个搞崩（历史上的 NPE + 卡 busy 数小时）。
 一次性的数据额度不值得再赌，留作手工实验。
+
+---
+
+## 2026-11-14 评审修复（`patches/0002-*.patch`，export schema = 6）
+
+完整的评审记录、验证方法和还没解决的问题见 [`review-2026-11-14.md`](review-2026-11-14.md)。这里只列代码改了什么。
+
+### 采集侧
+
+| 文件 | 改动 | 为什么 |
+|---|---|---|
+| `HuaweiSupportProvider.onFetchRecordedData()` | `enqueueProbeDownloads()` 用 `RESEARCH_FILE_PROBES = false` 关掉 | 这个 17 文件扫描里有 `sleep_state.bin`、`sleep_data.bin`、`rrisqi_data.bin`，回调只打日志就把数据丢了。每次同步真实数据被多下载一遍，还多发 14 个设备会回错误或 0 字节的请求。本文档上面写着「探针会把数据抢走」「同一个文件只允许一个消费者」，它正好违反了这两条 |
+| `HuaweiSupportProvider.enqueueFullSleepDump()` | 空数据不存；和最新一份逐字节相同就不再存；`files/dump/` 只留最新 5 份 | 原来每次同步存一份约 100 KB 的副本，永不清理；`fr.getData()` 为 null 时在 try 外面抛空指针 |
+| `HuaweiSupportProvider` 忙碌看门狗 | 只对同一个 busy 任务累计分钟数；`dispose()` 里停掉看门狗和探针定时器 | 原来不同任务接力占用 busy 也会被累计，10 分钟后误清；每次重连都多留一个在已销毁对象上空转的定时器 |
+| `ResponseManager.appendRriToFile()` | TLV 长度按 VarInt 读；`sqi = 0` 的拍也写入 | 一包 15 条记录（135 字节）时长度占 2 字节，原来的解析会把整包丢掉；丢掉 sqi=0 的拍会打断逐拍序列，过滤应该留给下游 |
+| `GBApplication.onCreate()` | 定时同步的启动挪到 `prefs` 初始化之后；监听器存进静态字段 | 原来启动时 `getPrefs()` 还是 null，异常被吞掉后永远按默认 6 小时排，「关闭」设置在每次进程重启后失效；监听器没有强引用会被回收，改设置不再生效 |
+
+### 导出侧（manifest schema 5 → 6，只加字段，`unique_keys` 的内容被纠正）
+
+| 改动 | 为什么 |
+|---|---|
+| 一次导出只取一个时间戳 `batch`，manifest 和所有 CSV 共用 | 原来每个文件各调一次 `stamp()`，跨秒时同一批会分成两个时间戳 |
+| manifest 先写 `manifest-<stamp>.json.tmp` 再改名；改名失败退回直接写 | manifest 出现就等于整批写完，下游不用靠修改时间猜 |
+| 所有表都导出成功且 manifest 写成功，才推进增量游标；`failed_tables` 记进 manifest | 原来某张表失败也照样推进，下一轮只回看 1 小时，这张表更早的行就永远不会再导出 |
+| 导出失败的半截 CSV 立即删除 | 不留下不在任何 manifest 里的文件 |
+| `files[].table`、`files[].primary_key`、`files[].key_columns`，由 `PRAGMA table_info` 读真实主键；`unique_keys` 改为按它生成 | 手写的键是错的：活动表真实主键是 `(TIMESTAMP, DEVICE_ID, OTHER_TIMESTAMP, SOURCE)`，原来只给了 `(TIMESTAMP, OTHER_TIMESTAMP)`；`workout-summary`、`workout-pace`、`device-attributes` 根本没列。`key_columns` 是同一个键换成 CSV 里的列名（时间列在 CSV 里叫 `epoch_s`） |
+| `raw_archive`：每个 raw 文件的 `name / bytes / sha256 / changed / complete` | 原来 `raw_files` 只有文件名。sha256 现在是对「实际写出去的字节」算的（文件只读一次），原来先算哈希再拷贝，中间 RRI 文件被追加就会对不上 |
+| `data_quality` 的间隔只在时间戳变化时计数 | 活动表成对行让 `interval_median_s` 恒为 0 |
+| manifest 和 CSV 按文件名时间戳保留 14 天（`retention_days` 写进 manifest）；清理残留的 `.json.tmp` | 原来只留最新 7 个 manifest、CSV 从不清理：几小时导出一次时，下游停一天就丢批次，而 CSV 无限堆积 |
+
+`raw_files`、`raw_files_new` 两个旧字段保留不变，schema 5 的消费者不受影响。
 
