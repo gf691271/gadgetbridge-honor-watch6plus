@@ -1,11 +1,12 @@
 # 补丁清单
 
-合集：`patches/all-changes.patch`（29 个文件，+3693 / -92）
+合集：`patches/all-changes.patch`（31 个文件，+3840 / -92）
 应用：`git apply patches/all-changes.patch`
 按提交拆分的版本：`patches/0001-*.patch`（5 个提交）+ `patches/0002-*.patch`（2026-11-14 评审修复，1 个提交）
 + `patches/0003-*.patch`（2026-11-15 类型映射 / 队列 / 单次下载，1 个提交）
 + `patches/0004-*.patch`（2026-11-15 研究用：能力位 dump / 类型字节扫描 / dict 睡眠，1 个提交）
-+ `patches/0005-*.patch`（2026-11-16 链路静默死亡的检测，1 个提交），
++ `patches/0005-*.patch`（2026-11-16 链路静默死亡的检测，1 个提交）
++ `patches/0006-*.patch`（2026-11-16 保活闹钟：15 分钟只做重连，1 个提交），
 用 `git am` 按顺序套，结果与合集逐字节一致。
 
 基线是上游 `master` 的提交 `6a322305eae857436e77b3a0f5b3ebc438b047e9`（不是 `0.95.1` tag，见
@@ -337,3 +338,27 @@ ACC 时间戳 100% 递增、拍间隔 100% 落在 300–2000 ms。
 从而走正常重连；后者只是把设备标成未连接，不会触发重连。
 
 日志标记：`RRI_LINKSTALE ... dropping connection`
+
+### 保活闹钟（0006，补 0005 补不到的那一半）
+
+0005 的看门狗只在「socket 还开着但没流量」时有用。11-15 那晚的实际原因是另一种：
+**22:01 被 `am force-stop` 之后重启，进程起来了但没去连**——`general_autoconnectonbluetooth`
+缺省 false，而 GB 自己的重连只从 `WAITING_FOR_RECONNECT` 触发。设备一直停在 `NOT_CONNECTED`。
+
+| 组件 | 作用 |
+|---|---|
+| `KeepAliveReceiver` | 每 15 分钟检查所有设备，有任何一个既没连也没初始化就调一次 `deviceService.connect()`；**不做同步** |
+| `KeepAliveScheduler` | 链式 `setAndAllowWhileIdle`，`GBApplication.onCreate` 里启动，偏好 `pref_keepalive_connect`（默认 true） |
+
+为什么不复用 `PERIODIC_SYNC`：它每 6 小时一次且每次都触发 `TYPE_SYNC` 全量同步，
+15 分钟一次太重，而 8 小时的窗口里 6 小时的间隔本身就可能整夜落空。
+
+日志标记：`KEEPALIVE connecting <设备> (state ...)`、`KEEPALIVE all devices already connected`
+
+三种断法现在各有人管：
+
+| 现象 | 谁来管 |
+|---|---|
+| 重启后没连、`NOT_CONNECTED` 无人触发 | **0006 保活闹钟** |
+| socket 半开、状态仍 `CONNECTED` | **0005 看门狗** |
+| 深度 Doze 下闹钟被推迟 | 系统限制，只能靠白名单（本机已豁免） |
