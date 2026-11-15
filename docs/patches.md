@@ -1,10 +1,11 @@
 # 补丁清单
 
-合集：`patches/all-changes.patch`（29 个文件，+3631 / -92）
+合集：`patches/all-changes.patch`（29 个文件，+3693 / -92）
 应用：`git apply patches/all-changes.patch`
 按提交拆分的版本：`patches/0001-*.patch`（5 个提交）+ `patches/0002-*.patch`（2026-11-14 评审修复，1 个提交）
 + `patches/0003-*.patch`（2026-11-15 类型映射 / 队列 / 单次下载，1 个提交）
-+ `patches/0004-*.patch`（2026-11-15 研究用：能力位 dump / 类型字节扫描 / dict 睡眠，1 个提交），
++ `patches/0004-*.patch`（2026-11-15 研究用：能力位 dump / 类型字节扫描 / dict 睡眠，1 个提交）
++ `patches/0005-*.patch`（2026-11-16 链路静默死亡的检测，1 个提交），
 用 `git am` 按顺序套，结果与合集逐字节一致。
 
 基线是上游 `master` 的提交 `6a322305eae857436e77b3a0f5b3ebc438b047e9`（不是 `0.95.1` tag，见
@@ -308,3 +309,31 @@ ACC 时间戳 100% 递增、拍间隔 100% 落在 300–2000 ms。
 
 每次连接还会打一行 `CAPS ...` 说明手表实际声明了哪些能力（没声明的能力，功能不工作
 和「设备从没声明」在日志里长得一样，这行用来分开）。
+
+---
+
+## 2026-11-16 新增（生产必需）
+
+### 链路静默死亡的检测
+
+11-15 实测：RFCOMM socket 在 **21:34** 之后就没有任何收发，但 Gadgetbridge **一直认为设备连着**
+——`AutoConnectIntervalReceiver` 到 23:58 还在打 `all devices are initialized`。
+状态停在 `CONNECTED`，而重连只从 `WAITING_FOR_RECONNECT` 触发，于是：
+
+- 20:04 那次定时同步正常（那时链路还活着）
+- 00:00 窗口打开，`openRriStream()` 往死 socket 写，异常被 catch 吞掉，**整夜零数据**
+- 00:14 手动点设备卡片才连上，`capture` 里只有 `session_start_in_window` + `open_requested`
+
+修法：`rriRepeat`（本来每 15 s 一次、本来就有 `lastRriPacketMs`）加两条判据：
+
+| 条件 | 动作 |
+|---|---|
+| 窗口内、开流后 5 分钟一个包都没有 | `brSupport.dropConnection()`，重置窗口计时 |
+| 窗口内、`lastRriPacketMs` 超过 15 分钟 | 同上 |
+| `openRriStream()` 写失败 | 立刻 `dropConnection()`，不等 15 分钟 |
+| 冷却 | 10 分钟内只掉一次（实测最长停顿 719 s = 12 分钟，不能当断线） |
+
+为什么用 `dropConnection()` 而不是 `disconnect()`：前者关 socket，让读线程像丢链一样失败，
+从而走正常重连；后者只是把设备标成未连接，不会触发重连。
+
+日志标记：`RRI_LINKSTALE ... dropping connection`

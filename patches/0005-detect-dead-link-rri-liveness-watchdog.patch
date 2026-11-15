@@ -1,0 +1,134 @@
+From d26ae01783259b9436ec5e7a84e532f16cb52bcb Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:12:17 +0800
+Subject: [PATCH] fix: detect a dead link instead of losing the night
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Measured on 2026-11-15: the RFCOMM socket stopped carrying traffic at 21:34 and Gadgetbridge
+never noticed. It kept the device marked CONNECTED (AutoConnectIntervalReceiver still logged
+"all devices are initialized" at 23:58), so nothing tried to reconnect — the state machine only
+retries from WAITING_FOR_RECONNECT. At 00:00 the sleep window opened, the open request was
+written into a dead socket, the exception was swallowed, and the whole window produced no beats
+until a manual tap at 00:14.
+
+The 15 s rriRepeat already runs in the window and already tracks lastRriPacketMs, so it now
+watches for a silent link:
+
+- inside the window, if the stream has not produced a single packet 5 min after the window
+  opened, or lastRriPacketMs is older than 15 min, call brSupport.dropConnection() so the normal
+  reconnect path takes over;
+- a failed openRriStream() write drops the link immediately instead of waiting 15 min;
+- both are rate limited to one drop per 10 min, because the sleep pauses measured on the watch
+  reach 12 minutes and must not be mistaken for a dead link.
+
+15 min rather than 10: the longest real pause measured over one night was 719 s.
+
+Compiled: assembleMainlineDebug BUILD_OK. Not installed yet — the capture window was running.
+---
+ .../devices/huawei/HuaweiSupportProvider.java | 66 ++++++++++++++++++-
+ 1 file changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index 0c52a90..e8d2390 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -325,6 +325,26 @@ public class HuaweiSupportProvider {
+     /** Wall-clock time of the last 0x19/0x05 packet, i.e. proof that the stream is live. */
+     private static volatile long lastRriPacketMs = 0L;
+     private static volatile long rriLastCloseMs = 0L;
++    /**
++     * Local patch: health check for the link itself.
++     *
++     * Measured 2026-11-15: the RFCOMM socket died at 21:34 and Gadgetbridge never noticed. It
++     * kept the device marked CONNECTED until 23:58 (still logging "all devices are initialized")
++     * and the midnight window then wrote the open request into a dead socket. Nothing reconnects
++     * while the state says CONNECTED, so the whole night was lost until a manual tap.
++     *
++     * A silent socket is only detectable by the absence of traffic, so the beat stream watches
++     * for it: no packet for RRI_LIVENESS_MS while the stream was supposed to be running means the
++     * link is dead, and dropConnection() lets the normal reconnect path take over.
++     */
++    private static final long RRI_LIVENESS_MS = 15 * 60 * 1000L;
++    /** Grace after the window opens before the watchdog judges: opening is not instant. */
++    private static final long RRI_LIVENESS_GRACE_MS = 5 * 60 * 1000L;
++    /** The long sleep pauses reach 12 min, so a reconnect is attempted at most this often. */
++    private static final long RRI_LINK_DROP_COOLDOWN_MS = 10 * 60 * 1000L;
++    private long windowEnteredMs = 0L;
++    private boolean rriOpenedThisWindow = false;
++    private long lastLinkDropMs = 0L;
+ 
+     /** Called by ResponseManager for every decoded RRI packet. */
+     public static void markRriPacket() {
+@@ -336,7 +356,23 @@ public class HuaweiSupportProvider {
+         public void run() {
+             long now = System.currentTimeMillis();
+             if (insideRriWindow()) {
+-                openRriStream();
++                if (windowEnteredMs == 0L) {
++                    windowEnteredMs = now;
++                }
++                if (!rriOpenedThisWindow && now - windowEnteredMs > RRI_LIVENESS_GRACE_MS) {
++                    // The stream never produced a packet in this window. Either the open request
++                    // never landed or the link is dead; both are fixed by reconnecting.
++                    LOG.info("RRI_LINKSTALE no packet since window start, dropping connection");
++                    dropDeadLink(now);
++                    windowEnteredMs = now;
++                } else if (rriOpenedThisWindow && now - lastRriPacketMs > RRI_LIVENESS_MS) {
++                    LOG.info("RRI_LINKSTALE last packet {}s ago, dropping connection",
++                            (now - lastRriPacketMs) / 1000);
++                    dropDeadLink(now);
++                    windowEnteredMs = now;
++                } else {
++                    openRriStream();
++                }
+             } else if (now - lastRriPacketMs < 120_000L && now - rriLastCloseMs > 300_000L) {
+                 // The device keeps streaming until told otherwise, so leaving the window
+                 // without a close would keep the optical sensor running all day. Only
+@@ -344,6 +380,8 @@ public class HuaweiSupportProvider {
+                 // noon does not send a pointless close command.
+                 LOG.info("RRI_WINDOW outside window, closing live stream");
+                 closeRriStream();
++                windowEnteredMs = 0L;
++                rriOpenedThisWindow = false;
+             }
+             rriHandler.postDelayed(this, 15000);
+         }
+@@ -358,8 +396,32 @@ public class HuaweiSupportProvider {
+                 logCaptureEvent("open_requested");
+             }
+             rriStreamOpened = true;
++            rriOpenedThisWindow = true;
++        } catch (Exception e) {
++            // A write failure here is the only signal a half-open socket gives us. Waiting for
++            // the 15 min liveness timeout would throw away a quarter of the night.
++            LOG.error("RRI stream open failed, dropping connection", e);
++            dropDeadLink(System.currentTimeMillis());
++        }
++    }
++
++    /** Local patch: let the normal reconnect path replace a link that stopped answering. */
++    private void dropDeadLink(long now) {
++        if (now - lastLinkDropMs < RRI_LINK_DROP_COOLDOWN_MS) {
++            return;
++        }
++        lastLinkDropMs = now;
++        rriStreamOpened = false;
++        rriOpenedThisWindow = false;
++        try {
++            if (brSupport != null) {
++                // Closing the socket (rather than marking the device disconnected) makes the
++                // read thread fail the way a lost link does, which is what triggers the normal
++                // reconnect path.
++                brSupport.dropConnection();
++            }
+         } catch (Exception e) {
+-            LOG.error("RRI stream open failed", e);
++            LOG.warn("dropConnection failed: {}", e.getMessage());
+         }
+     }
+ 
+-- 
+2.55.0.windows.2
+
