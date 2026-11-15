@@ -92,6 +92,24 @@ def main():
     print(f"packets that repeat the end of the previous one (>=3 beats): "
           f"{with_overlap} of {len(overlaps)}  ({repeated} repeated beats)")
 
+    # Coverage: how much wall time the beats actually account for, per uninterrupted run.
+    # Near 1.0 means no beat was lost; materially below 1.0 means the device is not sending
+    # every beat (a 4 s packet that carries ~3.6 s of beats is 0.75). This is the number to
+    # quote, not "beats per packet", because the latter depends on the heart rate.
+    ratios, run = [], [packets[0]]
+    for prev, cur in zip(packets, packets[1:]):
+        if cur[0] - prev[0] <= 60:
+            run.append(cur)
+        else:
+            if run[-1][0] - run[0][0] >= 300:
+                ratios.append(sum(sum(b) for _, b in run) / 1000.0 / (run[-1][0] - run[0][0]))
+            run = [cur]
+    if run[-1][0] - run[0][0] >= 300:
+        ratios.append(sum(sum(b) for _, b in run) / 1000.0 / (run[-1][0] - run[0][0]))
+    if ratios:
+        print(f"beat coverage     : median {median([round(r, 2) for r in ratios])}"
+              f"   min {min(ratios):.2f}  max {max(ratios):.2f}  ({len(ratios)} runs >= 5 min)")
+
     if with_overlap > 0.2 * len(overlaps):
         print("RESULT: OVERLAP - packets repeat beats; deduplicate before any HRV analysis")
         return 3
