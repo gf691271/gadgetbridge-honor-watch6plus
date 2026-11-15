@@ -71,8 +71,14 @@ def main():
                 break
             chunk = buf[i:i + ln]; i += ln
             if ln >= 6:
-                ts, flags = struct.unpack_from("<ih", chunk, 0)
-                acc.append((ts, flags))
+                ts = struct.unpack_from("<i", chunk, 0)[0]
+                # The 3 bytes after the timestamp are per-axis accelerometer activity,
+                # 0x00 = no activity, 0xff = high (upstream HuaweiTruSleepParser: "the 3rd
+                # axis is ignored as it's always high, due to gravity"). Upstream keeps only
+                # the first two as a short; we keep all three so movement can be correlated
+                # with snores later.
+                axes = tuple(chunk[4:7]) if ln >= 7 else (chunk[4], chunk[5], 0)
+                acc.append((ts, axes))
         elif tag == TAG_PPG:
             i += 1
             if i + 2 > len(buf):
@@ -108,6 +114,14 @@ def main():
         if out_of_order:
             print(f"WARNING: {out_of_order} beats go backwards in time, framing is suspect")
     print(f"ACC={len(acc)}  beats={len(beats)}")
+    if acc:
+        # How much the body moved, per axis, over the whole night (0..255 scale).
+        per_axis = list(zip(*[a[1] for a in acc]))
+        print("movement per axis (mean of 0x00-0xff activity): "
+              + " ".join("%.0f" % (sum(x) / len(x)) for x in per_axis))
+        movers = sum(1 for a in acc if max(a[1]) >= 0x80)
+        print(f"ACC samples with any axis >= 0x80: {movers} of {len(acc)}"
+              f" ({100.0 * movers / len(acc):.0f}%)")
     if not beats:
         return
 
