@@ -58,6 +58,7 @@ def main():
 
     beats = []   # (epoch_ms, peak, amp)
     acc = []
+    bad = 0
     i = 0
     while i < len(buf):
         tag = buf[i]
@@ -88,12 +89,24 @@ def main():
                 amps, j = decode_amp(count, chunk, j)
                 for p, a in zip(peaks, amps):
                     beats.append((ts * 1000 + p * 10, p, a))
-            except Exception:
-                pass
+            except Exception as e:
+                # Silent swallowing made bad records vanish from every statistic. Count them
+                # and say so; a high number means the framing model is wrong.
+                bad += 1
+                if bad <= 3:
+                    print(f"undecodable PPG record at {i}: {e}")
         else:
             i += 1
 
-    beats.sort()
+    # No sort: the records are already in file order and the peaks inside a record are
+    # time offsets. Sorting the tuples reordered beats by timestamp value within a record,
+    # which hid exactly the kind of ordering bug this decoder needs to surface.
+    if bad:
+        print(f"undecodable PPG records: {bad}")
+    if beats:
+        out_of_order = sum(1 for a, b in zip(beats, beats[1:]) if b[0] < a[0])
+        if out_of_order:
+            print(f"WARNING: {out_of_order} beats go backwards in time, framing is suspect")
     print(f"ACC={len(acc)}  beats={len(beats)}")
     if not beats:
         return

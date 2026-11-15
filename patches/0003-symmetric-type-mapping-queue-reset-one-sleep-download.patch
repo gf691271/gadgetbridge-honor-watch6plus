@@ -1,0 +1,252 @@
+From cf7392d257ae6ebc6bb439b5f7fd93bfb9b816db Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:02:19 +0800
+Subject: [PATCH] fix: symmetric file-type mapping, unstick the queue, one
+ sleep_data download
+
+Three defects, all found by reading the code after the Mac-side review, all confirmed
+against a real device log or blob on the PC side.
+
+1. convertFileTypeFrom2C only mapped 7 types while convertFileTypeTo2C mapped all 19,
+   so every answer for another type became UNKNOWN, the download was aborted as "wrong
+   file received", and the size the device sent was never logged. Re-running the 11-09
+   sweep log through the rewritten decoder now shows the device answers a full response
+   for 26 of 26 types (0x00-0x19) and refuses none of them; 0x23281 (144001) with size 0
+   means "accepted, nothing in this window", not an error. The old conclusion "the
+   firmware only accepts 5 file types" was an artifact of this asymmetry.
+
+2. Two handleException overrides in HuaweiFileDownloadManager did not call reset(), so
+   one unparsable answer left isBusy true forever and every later download waited in the
+   queue until the connection dropped. That is a concrete source of the hours-long "busy"
+   hangs.
+
+3. downloadTruSleepData queued sleep_data.bin a third time per sync. Its payload never
+   reached a consumer (parseData/analyze are commented out upstream), and the archive
+   already fetches the same file. SleepFileDownloadCallback gained a status-only
+   constructor so syncComplete still fires. enqueueFullSleepDump now ignores a repeat
+   request within 10 minutes.
+
+Also: the research probe sweep is now behind the device preference
+pref_research_file_probes and runs at most once per process (it used to run on every
+sync and download the real sleep files only to discard them), probe payloads are written
+to files/probe/ instead of being dropped, and the FILEDL_RAW hook also logs 0x2C/0x02 so
+the hash pre-check can be evaluated from logs.
+
+Compiled: assembleMainlineDebug BUILD_OK. Not yet installed or run on the device.
+---
+ .../devices/huawei/HuaweiTruSleepParser.java  | 12 ++++
+ .../huawei/HuaweiFileDownloadManager.java     |  8 +++
+ .../devices/huawei/HuaweiSupportProvider.java | 71 +++++++++++++++----
+ .../devices/huawei/ResponseManager.java       |  5 +-
+ .../requests/GetFileDownloadInitRequest.java  | 13 ++++
+ 5 files changed, 96 insertions(+), 13 deletions(-)
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/HuaweiTruSleepParser.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/HuaweiTruSleepParser.java
+index c26573f..9719552 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/HuaweiTruSleepParser.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/HuaweiTruSleepParser.java
+@@ -440,6 +440,18 @@ public class HuaweiTruSleepParser {
+             this.provider = provider;
+         }
+ 
++        /**
++         * Local patch: status-only mode. syncComplete() only reads statusData, and the two
++         * lines that used sleepData are commented out upstream, so downloading the whole
++         * sleep_data blob a second time just to satisfy this callback is 100 KB per sync
++         * for nothing. With [statusOnly] the callback is complete as soon as the state file
++         * arrives.
++         */
++        public SleepFileDownloadCallback(HuaweiSupportProvider provider, boolean statusOnly) {
++            this(provider);
++            this.dataSynced = statusOnly;
++        }
++
+         public void syncComplete(byte[] statusData, byte[] sleepData) { }
+         @Override
+         public void downloadException(HuaweiFileDownloadManager.HuaweiFileDownloadException e) {
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiFileDownloadManager.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiFileDownloadManager.java
+index 871d58f..ab41586 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiFileDownloadManager.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiFileDownloadManager.java
+@@ -544,6 +544,10 @@ public class HuaweiFileDownloadManager {
+                 @Override
+                 public void handleException(Request.ResponseParseException e) {
+                     currentFileRequest.fileDownloadCallback.downloadException(new HuaweiFileDownloadRequestException(null, this.getClass(), e));
++                    // Local patch: without reset() isBusy stays true forever and every later
++                    // download waits in the queue until the connection drops. One answer the
++                    // parser could not read used to wedge the sync for hours.
++                    reset();
+                 }
+             });
+         }
+@@ -665,6 +669,10 @@ public class HuaweiFileDownloadManager {
+             @Override
+             public void handleException(Request.ResponseParseException e) {
+                 currentFileRequest.fileDownloadCallback.downloadException(new HuaweiFileDownloadRequestException(currentFileRequest, this.getClass(), e));
++                // Local patch: the init answer is where an unsupported file type shows up as
++                // an unparsable packet (four tags missing). Not resetting here meant one such
++                // answer stopped the whole download queue.
++                reset();
+             }
+ 
+             @Override
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index 57a51b7..51b2742 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -308,7 +308,16 @@ public class HuaweiSupportProvider {
+      * second time ahead of the archive and parse requests, and the device has to answer
+      * 14 more requests with an error or with size 0. Keep it off while collecting data.
+      */
+-    private static final boolean RESEARCH_FILE_PROBES = false;
++    /**
++     * Local research patch: sweep all known file ids once, on demand.
++     *
++     * Gated twice on purpose. The compile-time constant says whether the code exists at all;
++     * the device preference `pref_research_file_probes` says whether it runs, and the
++     * static flag keeps it to one sweep per process. It used to run on every sync, which
++     * meant the real sleep files were downloaded a second time and discarded, in front of
++     * the archive request.
++     */
++    private static boolean probeSweepDone = false;
+ 
+     /** How many sleep_data dumps stay in files/dump. The export only reads the newest one. */
+     private static final int KEEP_SLEEP_DUMPS = 5;
+@@ -2029,9 +2038,10 @@ public class HuaweiSupportProvider {
+     }
+ 
+     public void onFetchRecordedData(int dataTypes) {
+-        // Local research patch: probe every known file id. Off by default, because the sweep
+-        // re-downloads the real sleep files and discards them (see RESEARCH_FILE_PROBES).
+-        if (RESEARCH_FILE_PROBES) {
++        // Local research patch: probe every known file id, only when explicitly enabled for
++        // this device and only once per process.
++        if (!probeSweepDone && researchFileProbesEnabled()) {
++            probeSweepDone = true;
+             try {
+                 int end = (int) (System.currentTimeMillis() / 1000L);
+                 // 48h is the window that actually returned data during the type sweep.
+@@ -3506,7 +3516,11 @@ public class HuaweiSupportProvider {
+         if (downloadDictTrueSleepData(start, end))
+             return true;
+ 
+-        HuaweiTruSleepParser.SleepFileDownloadCallback callback = new HuaweiTruSleepParser.SleepFileDownloadCallback(this) {
++        // Local patch: status-only. syncComplete() ignores sleepData (its two consumers are
++        // commented out upstream), so the blob is not downloaded here at all -- the archive
++        // path (enqueueFullSleepDump) is the only consumer now, which is what keeps the
++        // "only one consumer per file" rule.
++        HuaweiTruSleepParser.SleepFileDownloadCallback callback = new HuaweiTruSleepParser.SleepFileDownloadCallback(this, true) {
+             @Override
+             public void syncComplete(byte[] statusData, byte[] sleepData) {
+                 LOG.debug("Sync of TruSleep status and data finished");
+@@ -3546,12 +3560,10 @@ public class HuaweiSupportProvider {
+                 wideEnd,
+                 callback
+         ), true);
+-        huaweiFileDownloadManager.addToQueue(HuaweiFileDownloadManager.FileRequest.sleepDataFileRequest(
+-                getDeviceState().getSupportsTruSleepNewSync(),
+-                wideStart,
+-                wideEnd,
+-                callback
+-        ), true);
++        // Local patch: the sleep_data request that used to be queued here was removed.
++        // Its payload never reached a consumer (parseData/analyze are commented out
++        // upstream) and the archive already fetches the same file, so one sync used to
++        // transfer the same ~100 KB three times.
+         return true;
+     }
+ 
+@@ -3561,6 +3573,37 @@ public class HuaweiSupportProvider {
+      * Each result is logged as FILEDL_INIT name=... id=... size=..., which tells us whether
+      * the device has data for that id (size > 0) or not (size == 0 / error TLV).
+      */
++    /** Keep the payload of a research probe so it can be parsed offline. */
++    private void saveProbePayload(String name, byte[] payload) {
++        try {
++            java.io.File dir = new java.io.File(getContext().getExternalFilesDir(null), "probe");
++            if (!dir.exists() && !dir.mkdirs())
++                return;
++            String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
++                    .format(new java.util.Date());
++            java.io.File out = new java.io.File(dir, stamp + "-" + name);
++            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
++                fos.write(payload);
++            }
++            LOG.info("FILEDL_SAVED {} bytes={}", out.getAbsolutePath(), payload.length);
++        } catch (Exception e) {
++            LOG.warn("FILEDL_SAVED failed for {}: {}", name, e.getMessage());
++        }
++    }
++
++    /** Device preference `pref_research_file_probes`, false unless it was set on purpose. */
++    private boolean researchFileProbesEnabled() {
++        try {
++            if (gbDevice == null)
++                return false;
++            return nodomain.freeyourgadget.gadgetbridge.GBApplication
++                    .getDeviceSpecificSharedPrefs(gbDevice.getAddress())
++                    .getBoolean("pref_research_file_probes", false);
++        } catch (Exception e) {
++            return false;
++        }
++    }
++
+     private void enqueueProbeDownloads(int start, int end) {
+         final String[] names = {
+                 "atrial_data.bin",
+@@ -3611,7 +3654,11 @@ public class HuaweiSupportProvider {
+                     new HuaweiFileDownloadManager.FileDownloadCallback() {
+                         @Override
+                         public void downloadComplete(HuaweiFileDownloadManager.FileRequest fileRequest, @Nullable File localRawFile) {
+-                            LOG.info("FILEDL_DONE name={} bytes={}", name, fileRequest.getData().length);
++                            byte[] payload = fileRequest.getData();
++                            LOG.info("FILEDL_DONE name={} bytes={}", name, payload.length);
++                            // A file that is never written down is a file we threw away.
++                            if (payload.length > 0)
++                                saveProbePayload(name, payload);
+                         }
+ 
+                         @Override
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
+index 21635b0..da8c024 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
+@@ -150,7 +150,10 @@ public class ResponseManager {
+                 }
+ 
+                 // Local patch: surface HR / RRI samples, which Gadgetbridge otherwise drops.
+-                if (receivedPacket.serviceId == 0x2C && receivedPacket.commandId == 0x01) {
++                // Local patch: 0x02 (file hash) is logged too. Its raw answer is the only way to
++                // tell "device has no hash for this id" from "device ignores the request".
++                if (receivedPacket.serviceId == 0x2C
++                        && (receivedPacket.commandId == 0x01 || receivedPacket.commandId == 0x02)) {
+                     try {
+                         java.lang.reflect.Field tlvField = HuaweiPacket.class.getDeclaredField("tlv");
+                         tlvField.setAccessible(true);
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetFileDownloadInitRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetFileDownloadInitRequest.java
+index c9da476..9426e4e 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetFileDownloadInitRequest.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetFileDownloadInitRequest.java
+@@ -57,6 +57,19 @@ public class GetFileDownloadInitRequest extends Request {
+     }
+ 
+     private HuaweiFileDownloadManager.FileType convertFileTypeFrom2C(FileDownloadService2C.FileType type) {
++        // Local patch: map by raw byte, exactly like convertFileTypeTo2C above. The upstream
++        // switch below only knew 7 types and turned every other answer into UNKNOWN, so a file
++        // the device does accept (but Gadgetbridge never used) was reported as "wrong file
++        // received" and the size the device sent was thrown away. That made the device look
++        // like it refuses 12 of the 19 known ids, which was never tested.
++        if (type != null && type != FileDownloadService2C.FileType.UNKNOWN) {
++            for (HuaweiFileDownloadManager.FileType t : HuaweiFileDownloadManager.FileType.values()) {
++                if (t != HuaweiFileDownloadManager.FileType.UNKNOWN
++                        && t != HuaweiFileDownloadManager.FileType.DEBUG
++                        && t.value == type.value)
++                    return t;
++            }
++        }
+         return switch (type) {
+             case SLEEP_STATE -> HuaweiFileDownloadManager.FileType.SLEEP_STATE;
+             case SLEEP_DATA -> HuaweiFileDownloadManager.FileType.SLEEP_DATA;
+-- 
+2.55.0.windows.2
+

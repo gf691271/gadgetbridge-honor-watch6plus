@@ -1,8 +1,9 @@
 # 补丁清单
 
-合集：`patches/all-changes.patch`（27 个文件，+3355 / -87）
+合集：`patches/all-changes.patch`（28 个文件，+3448 / -92）
 应用：`git apply patches/all-changes.patch`
-按提交拆分的版本：`patches/0001-*.patch`（5 个提交）+ `patches/0002-*.patch`（2026-11-14 评审修复，1 个提交），
+按提交拆分的版本：`patches/0001-*.patch`（5 个提交）+ `patches/0002-*.patch`（2026-11-14 评审修复，1 个提交）
++ `patches/0003-*.patch`（2026-11-15 类型映射 / 队列 / 单次下载，1 个提交），
 用 `git am` 按顺序套，结果与合集逐字节一致。
 
 基线是上游 `master` 的提交 `6a322305eae857436e77b3a0f5b3ebc438b047e9`（不是 `0.95.1` tag，见
@@ -253,3 +254,45 @@ manifest 因此升到 **schema = 5**：新增 `raw_files`（当前归档全集�
 
 `raw_files`、`raw_files_new` 两个旧字段保留不变，schema 5 的消费者不受影响。
 
+
+---
+
+## 2026-11-15 新增（生产必需）
+
+### 文件类型映射对称化
+
+`GetFileDownloadInitRequest.convertFileTypeTo2C()` 早先被改成按字节映射，但
+`convertFileTypeFrom2C()` 没改，还是上游那个只认 7 种的 `switch`。后果是：
+设备对其它类型回的完整 answer（name / type / transfer_id / size）被判成
+「wrong file received」，异常在打印 `FILEDL_INIT` 之前抛出，**大小和类型字节都丢了**。
+
+由此得出的「固件只认 5 种文件」结论作废。重跑 11-09 日志：26 种类型全部有完整回包，
+零拒绝。`0x7F = 0x00023281` 配 `size = 0` = 「接受但没数据」，`0x000186A0` = 正常。
+
+### 下载队列卡死的两个来源
+
+`HuaweiFileDownloadManager` 里有两处 `handleException` 只通知回调、不调 `reset()`：
+一处是 init 的（不认识的类型会在 init 上表现为缺 tag），一处是参数请求的。
+不 `reset()` 则 `isBusy` 永远是 true，后续所有下载排队不动，直到连接断开。
+这是「busy 卡几个小时」的一个确定来源。
+
+### `sleep_data.bin` 每次同步从 3 次降到 1 次
+
+`downloadTruSleepData()` 里为满足 `SleepFileDownloadCallback`（要两个文件都到才
+`syncComplete`）额外请求了一遍 `sleep_data.bin`，但 `syncComplete` 只用 `statusData`，
+用到 `sleepData` 的两行上游本来就是注释掉的。现在给回调加了 status-only 构造，
+只请求 `sleep_state.bin`；归档请求 10 分钟内不重复。
+
+### 探针改成显式开关
+
+`pref_research_file_probes`（设备偏好，默认 false）+ 每进程只跑一次。
+探针拿到的内容以前只打一行长度，现在写到 `files/probe/`。
+`FILEDL_RAW` 的钩子扩到 `0x2C/0x02`，为 hash 预检铺路。
+
+### 逐拍 blob 的解码可信度
+
+新增 `decoders/check_trusleep_framing.py`（C1–C6 判据）。在 11-09 那份真实 blob 上：
+记录边界 100%、记录间无非零字节、峰值无符号差分单调 100%（有符号只有 94.5%）、
+ACC 时间戳 100% 递增、拍间隔 100% 落在 300–2000 ms。
+**结论：无符号差分正确，Python 解码器的时间轴可信，可以做信号级分析。**
+顺带修正：那份 blob 是 6.02 小时 / 20513 拍 / 平均 **56.8 bpm**，不是文档里写的 72。
