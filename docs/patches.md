@@ -1,9 +1,10 @@
 # 补丁清单
 
-合集：`patches/all-changes.patch`（28 个文件，+3448 / -92）
+合集：`patches/all-changes.patch`（29 个文件，+3631 / -92）
 应用：`git apply patches/all-changes.patch`
 按提交拆分的版本：`patches/0001-*.patch`（5 个提交）+ `patches/0002-*.patch`（2026-11-14 评审修复，1 个提交）
-+ `patches/0003-*.patch`（2026-11-15 类型映射 / 队列 / 单次下载，1 个提交），
++ `patches/0003-*.patch`（2026-11-15 类型映射 / 队列 / 单次下载，1 个提交）
++ `patches/0004-*.patch`（2026-11-15 研究用：能力位 dump / 类型字节扫描 / dict 睡眠，1 个提交），
 用 `git am` 按顺序套，结果与合集逐字节一致。
 
 基线是上游 `master` 的提交 `6a322305eae857436e77b3a0f5b3ebc438b047e9`（不是 `0.95.1` tag，见
@@ -296,3 +297,14 @@ manifest 因此升到 **schema = 5**：新增 `raw_files`（当前归档全集�
 ACC 时间戳 100% 递增、拍间隔 100% 落在 300–2000 ms。
 **结论：无符号差分正确，Python 解码器的时间轴可信，可以做信号级分析。**
 顺带修正：那份 blob 是 6.02 小时 / 20513 拍 / 平均 **56.8 bpm**，不是文档里写的 72。
+
+### 研究用开关（0004，默认全关）
+
+| 设备偏好 | 作用 | 日志标记 |
+|---|---|---|
+| `pref_research_file_probes` | 扫 17 个已知文件类型（已验证全部 size=0） | `FILEDL_INIT` / `FILEDL_DONE` |
+| `pref_research_raw_types` | 对 0x1A–0x40、0x7F、0xFF 发 `0x2C/0x01`，判断 `0x23281` 的含义 | `RAWTYPE`、`FILEDL_RAW` |
+| `pref_research_dict_sleep` | 强行请求 dict 睡眠序列（`SLEEP_DETAILS_CLASS=700013`），原始字节先落盘 | `DICTSLEEP`、`files/probe/` |
+
+每次连接还会打一行 `CAPS ...` 说明手表实际声明了哪些能力（没声明的能力，功能不工作
+和「设备从没声明」在日志里长得一样，这行用来分开）。

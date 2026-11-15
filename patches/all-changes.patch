@@ -1750,7 +1750,7 @@ index 583c919..ab41586 100644
  
              @Override
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..51b2742 100644
+index 19582f3..0c52a90 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -2203,10 +2203,14 @@ index 19582f3..51b2742 100644
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +2038,50 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +2038,54 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
++        // Local research patch: capability dump, then the opt-in research probes.
++        logDeclaredCapabilities();
++        probeRawTypeIds();
++        tryDictSleepOnce();
 +        // Local research patch: probe every known file id, only when explicitly enabled for
 +        // this device and only once per process.
 +        if (!probeSweepDone && researchFileProbesEnabled()) {
@@ -2254,7 +2258,7 @@ index 19582f3..51b2742 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2690,66 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2694,66 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -2321,7 +2325,7 @@ index 19582f3..51b2742 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3358,10 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3362,10 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -2332,7 +2336,7 @@ index 19582f3..51b2742 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,14 +3508,19 @@ public class HuaweiSupportProvider {
+@@ -2978,14 +3512,19 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -2355,7 +2359,7 @@ index 19582f3..51b2742 100644
              @Override
              public void syncComplete(byte[] statusData, byte[] sleepData) {
                  LOG.debug("Sync of TruSleep status and data finished");
-@@ -3014,24 +3549,131 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3553,252 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -2409,14 +2413,135 @@ index 19582f3..51b2742 100644
 +        }
 +    }
 +
++    /**
++     * Local research patch: print what the watch says it can do, once per connection.
++     *
++     * Every capability below is a bit the device reported; Gadgetbridge silently falls back
++     * when one is missing, which makes "the feature does not work" indistinguishable from
++     * "the device never claimed it". This line tells the two apart from a log.
++     */
++    private void logDeclaredCapabilities() {
++        try {
++            if (getDeviceState() == null) {
++                return;
++            }
++            LOG.info("CAPS dual={} extend={} truSleep={} truSleepNew={} rriNew={} gpsNew={}"
++                            + " dictSleep={} hr={} realtimeHr={} spo2={} stress={} autoStress={}",
++                    getDeviceState().supportsDualSocket(),
++                    getDeviceState().supportsExtendSocket(),
++                    getDeviceState().supportsTruSleep(),
++                    getDeviceState().getSupportsTruSleepNewSync(),
++                    getDeviceState().getSupportsRriNewSync(),
++                    getDeviceState().isSupportsGpsNewSync(),
++                    getDeviceState().supportsDictSleepSync(),
++                    getDeviceState().supportsHeartRate(),
++                    getDeviceState().supportsRealtimeHeartRate(),
++                    getDeviceState().supportsSPo2(),
++                    getDeviceState().supportsAutoStress(),
++                    getDeviceState().supportsAutoStress());
++        } catch (Exception e) {
++            LOG.warn("CAPS dump failed: {}", e.getMessage());
++        }
++    }
++
++    /** Once per process. */
++    private static boolean rawTypeSweepDone = false;
++
++    /**
++     * Local research patch: ask 0x2C for type bytes that are not in the enumerated list
++     * (0x1A-0x40, 0x7F, 0xFF) so the meaning of `7F = 0x00023281` can be decided:
++     * a different code for an impossible type means 0x23281 really is "valid, no data".
++     *
++     * Read-only: init requests only, addToResponse = false, nothing transferred.
++     * Gated by `pref_research_raw_types`, default false.
++     */
++    private void probeRawTypeIds() {
++        if (rawTypeSweepDone || !researchPrefEnabled("pref_research_raw_types")) {
++            return;
++        }
++        rawTypeSweepDone = true;
++        final int end = (int) (System.currentTimeMillis() / 1000L);
++        final int start = end - 48 * 3600;
++        LOG.info("RAWTYPE sweep start");
++        for (int id = 0x1A; id <= 0x40; id++) {
++            sendRawTypeProbe((byte) id, start, end);
++        }
++        sendRawTypeProbe((byte) 0x7F, start, end);
++        sendRawTypeProbe((byte) 0xFF, start, end);
++        LOG.info("RAWTYPE sweep queued");
++    }
++
++    private void sendRawTypeProbe(final byte id, final int start, final int end) {
++        try {
++            new nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests
++                    .SendRawTypeProbeRequest(this, id, start, end).doPerform();
++        } catch (Exception e) {
++            LOG.info("RAWTYPE 0x{} send failed: {}", String.format("%02X", id & 0xFF), e.getMessage());
++        }
++    }
++
++    /** Once per process. */
++    private static boolean dictSleepTried = false;
++
++    /**
++     * Local research patch: ask for the dict-based sleep sequence even when the device does
++     * not declare support for it, and store the payload before parsing it.
++     *
++     * Why: `sleep_data.bin` has not changed since 11-13 even on nights the watch was worn,
++     * while the dict path (`sequenceDataFileRequest` with SLEEP_DETAILS_CLASS = 700013) is a
++     * different shape of the same information. A payload may be handed out only once, so it
++     * is written to files/probe/ before anything tries to parse it.
++     *
++     * Gated by `pref_research_dict_sleep`, default false.
++     */
++    private void tryDictSleepOnce() {
++        if (dictSleepTried || !researchPrefEnabled("pref_research_dict_sleep")) {
++            return;
++        }
++        dictSleepTried = true;
++        final int end = (int) (System.currentTimeMillis() / 1000L);
++        final int start = end - 48 * 3600;
++        LOG.info("DICTSLEEP requested (declared support: {})",
++                getDeviceState() != null && getDeviceState().supportsDictSleepSync());
++        try {
++            huaweiFileDownloadManager.addToQueue(HuaweiFileDownloadManager.FileRequest
++                    .sequenceDataFileRequest(start, end,
++                            nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiDictTypes
++                                    .SLEEP_DETAILS_CLASS,
++                            new HuaweiFileDownloadManager.FileDownloadCallback() {
++                                @Override
++                                public void downloadComplete(HuaweiFileDownloadManager.FileRequest fr,
++                                                             @Nullable File localRawFile) {
++                                    byte[] payload = fr.getData();
++                                    LOG.info("DICTSLEEP bytes={}", payload == null ? -1 : payload.length);
++                                    if (payload != null && payload.length > 0) {
++                                        saveProbePayload("dict_sleep_700013.bin", payload);
++                                    }
++                                }
++
++                                @Override
++                                public void downloadException(HuaweiFileDownloadManager.HuaweiFileDownloadException e) {
++                                    LOG.info("DICTSLEEP failed: {}", e.getMessage());
++                                }
++                            }), false);
++        } catch (Exception e) {
++            LOG.warn("DICTSLEEP enqueue failed: {}", e.getMessage());
++        }
++    }
++
 +    /** Device preference `pref_research_file_probes`, false unless it was set on purpose. */
 +    private boolean researchFileProbesEnabled() {
++        return researchPrefEnabled("pref_research_file_probes");
++    }
++
++    /** Read an opt-in research flag from this device's preferences. */
++    private boolean researchPrefEnabled(String key) {
 +        try {
 +            if (gbDevice == null)
 +                return false;
 +            return nodomain.freeyourgadget.gadgetbridge.GBApplication
 +                    .getDeviceSpecificSharedPrefs(gbDevice.getAddress())
-+                    .getBoolean("pref_research_file_probes", false);
++                    .getBoolean(key, false);
 +        } catch (Exception e) {
 +            return false;
 +        }
@@ -2496,7 +2621,7 @@ index 19582f3..51b2742 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +3947,30 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +4072,30 @@ public class HuaweiSupportProvider {
      }
  
  }
@@ -3785,6 +3910,70 @@ index 0000000..c390851
 +                    paramsProvider, filename, fileType, startTime, endTime).serialize();
 +        } catch (HuaweiPacket.CryptoException e) {
 +            throw new Request.RequestCreationException(e);
++        }
++    }
++}
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendRawTypeProbeRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendRawTypeProbeRequest.java
+new file mode 100644
+index 0000000..1badf62
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/SendRawTypeProbeRequest.java
+@@ -0,0 +1,58 @@
++/*  Local research patch (not upstream): ask 0x2C for a file type byte that is not in the
++    enumerated list, to learn how the device answers an id it cannot know.
++
++    Why: 26 known types (0x00-0x19) all answer with a full TLV plus `7F = 0x00023281` and
++    size 0. `0x23281` is not a constant anywhere in upstream, so there are two readings:
++      A: the type is valid and there is simply nothing to send;
++      B: it is a generic "nothing to give" code that says nothing about support.
++    A type byte the device must reject (0x1A-0x40, 0x7F, 0xFF) separates them: if it answers
++    with a different code, reading A holds.
++
++    Safety: this is a plain `0x2C/0x01` init request with `addToResponse = false`, so the
++    answer is not claimed by any handler and never enters the download queue. Nothing is
++    transferred and nothing is consumed. ResponseManager logs the raw TLV of a 0x2C/0x01
++    answer as `FILEDL_RAW` before dispatch, which is where the 7F value is read from.
++
++    Rollback: the caller is behind `pref_research_raw_types`, default false.
++*/
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import java.util.List;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.FileDownloadService2C;
++import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.HuaweiSupportProvider;
++
++public class SendRawTypeProbeRequest extends Request {
++    private final byte rawType;
++    private final int startTime;
++    private final int endTime;
++
++    public SendRawTypeProbeRequest(HuaweiSupportProvider support, byte rawType, int startTime, int endTime) {
++        super(support);
++        this.serviceId = FileDownloadService2C.id;
++        this.commandId = FileDownloadService2C.FileDownloadInit.id;
++        this.rawType = rawType;
++        this.startTime = startTime;
++        this.endTime = endTime;
++        this.addToResponse = false;
++    }
++
++    public byte getRawType() {
++        return rawType;
++    }
++
++    @Override
++    protected List<byte[]> createRequest() throws RequestCreationException {
++        try {
++            // A name is mandatory in the request even though the device ignores it for an
++            // unknown type; keeping it obviously fake makes the log line unambiguous.
++            String name = "probe_0x" + String.format("%02x", rawType & 0xFF) + ".bin";
++            return new FileDownloadService2C.FileDownloadInit.Request(
++                    paramsProvider, name, rawType, startTime, endTime
++            ).serialize();
++        } catch (HuaweiPacket.CryptoException e) {
++            throw new RequestCreationException(e);
 +        }
 +    }
 +}
