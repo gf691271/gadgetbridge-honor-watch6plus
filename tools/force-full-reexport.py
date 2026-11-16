@@ -34,6 +34,11 @@ def sh(cmd, t=120):
     return subprocess.run([ADB, "shell", cmd], capture_output=True, text=True, timeout=t).stdout
 
 
+def attached():
+    out = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=30).stdout
+    return any(line.strip().endswith("device") for line in out.splitlines()[1:])
+
+
 def read_state():
     return subprocess.run([ADB, "shell", "cat", STATE],
                           capture_output=True, text=True, timeout=60).stdout
@@ -55,7 +60,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=240)
     args = ap.parse_args()
 
-    if "\tdevice" not in sh("devices"):
+    if not attached():
         print("no device attached")
         return 1
 
