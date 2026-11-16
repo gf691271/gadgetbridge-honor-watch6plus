@@ -1,0 +1,98 @@
+From bea7e8cb5963a74ecc60ba611e6db9c7874319e3 Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:26:06 +0800
+Subject: [PATCH] fix: stop re-opening a stream that is already open
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Measured on the night of 2026-11-16 (5,644 packets of 0x19/0x05): the largest gap between
+two consecutive packets was 42 s, and the "silences" the CSV report are not missing packets
+at all — the device keeps sending every ~14 s, with timestamp 0 and every slot rri=0, i.e.
+the PPG has no pulse to report. 110 of 148 packets inside the 62-minute gap were like that.
+
+Meanwhile the 15 s re-open produced 1,304 writes in one night, and 194 of the 236 error
+answers on this channel (code 0x0001E84A) arrived within 10 s of one of them: the device was
+rejecting "open" on a stream that was already open. The error rate peaks in the same hour as
+the empty packets (02:00: 25 % of that hour's frames).
+
+The window tick now asks the device to open only when the channel is genuinely quiet:
+
+  nothing at all since the window opened, past the 5 min grace  -> drop the link
+  no packet for 15 min                                        -> drop the link
+  no packet for 90 s, or nothing yet in this window            -> send one open
+  otherwise                                                    -> do nothing
+
+90 s is twice the largest measured gap. A stream that is merely beatless needs nothing:
+lastRriPacketMs is refreshed by every packet, empty ones included.
+
+Compiled: assembleMainlineDebug BUILD_OK.
+
+Also measured this session, for the record:
+- 0006 keepalive verified on device: screen off + force-stop + am start does not connect
+  (autoconnect=false), and 18.5 min later KeepAliveReceiver fired and connected in 1 s.
+- The 11-15 loss was "screen off + general_autoconnectonbluetooth=false": the app never even
+  logged "Will attempt to connect", because the activity never resumed.
+---
+ .../devices/huawei/HuaweiSupportProvider.java | 32 +++++++++++++++----
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index e8d2390..655ced9 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -342,6 +342,20 @@ public class HuaweiSupportProvider {
+     private static final long RRI_LIVENESS_GRACE_MS = 5 * 60 * 1000L;
+     /** The long sleep pauses reach 12 min, so a reconnect is attempted at most this often. */
+     private static final long RRI_LINK_DROP_COOLDOWN_MS = 10 * 60 * 1000L;
++    /**
++     * Local patch: how long the beat stream may be silent before the open request is sent
++     * again.
++     *
++     * Measured over one full night (2026-11-16): 5,644 packets, the largest gap between two
++     * consecutive 0x19/0x05 packets was 42 s. A stream that is quiet for 90 s has therefore
++     * really stopped, while one that is merely reporting no beats keeps sending empty
++     * packets (timestamp 0, all slots zero) and needs nothing.
++     *
++     * Re-opening every 15 s as before produced 1,304 writes per night, and 194 of the 236
++     * error answers on this channel (code 0x0001E84A) arrived within 10 s of one of them:
++     * the device was rejecting "open" on a stream that was already open.
++     */
++    private static final long RRI_REOPEN_AFTER_SILENCE_MS = 90 * 1000L;
+     private long windowEnteredMs = 0L;
+     private boolean rriOpenedThisWindow = false;
+     private long lastLinkDropMs = 0L;
+@@ -359,18 +373,24 @@ public class HuaweiSupportProvider {
+                 if (windowEnteredMs == 0L) {
+                     windowEnteredMs = now;
+                 }
+-                if (!rriOpenedThisWindow && now - windowEnteredMs > RRI_LIVENESS_GRACE_MS) {
+-                    // The stream never produced a packet in this window. Either the open request
+-                    // never landed or the link is dead; both are fixed by reconnecting.
++                // Every 0x19/0x05 arrival refreshes lastRriPacketMs, empty packets included,
++                // so this is "did the channel carry anything", not "did we get beats".
++                boolean heardSinceWindow = lastRriPacketMs >= windowEnteredMs;
++                long silenceMs = now - lastRriPacketMs;
++                if (!heardSinceWindow && now - windowEnteredMs > RRI_LIVENESS_GRACE_MS) {
++                    // Nothing at all since the window opened: the open request never landed or
++                    // the link is dead. Reconnecting is the fix for both.
+                     LOG.info("RRI_LINKSTALE no packet since window start, dropping connection");
+                     dropDeadLink(now);
+                     windowEnteredMs = now;
+-                } else if (rriOpenedThisWindow && now - lastRriPacketMs > RRI_LIVENESS_MS) {
++                } else if (silenceMs > RRI_LIVENESS_MS) {
+                     LOG.info("RRI_LINKSTALE last packet {}s ago, dropping connection",
+-                            (now - lastRriPacketMs) / 1000);
++                            silenceMs / 1000);
+                     dropDeadLink(now);
+                     windowEnteredMs = now;
+-                } else {
++                } else if (!heardSinceWindow || silenceMs > RRI_REOPEN_AFTER_SILENCE_MS) {
++                    // Ask again only when the channel is actually quiet. While the device is
++                    // streaming (even with empty packets) a new request is rejected.
+                     openRriStream();
+                 }
+             } else if (now - lastRriPacketMs < 120_000L && now - rriLastCloseMs > 300_000L) {
+-- 
+2.55.0.windows.2
+

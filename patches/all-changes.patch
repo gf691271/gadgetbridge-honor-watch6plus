@@ -1909,7 +1909,7 @@ index 583c919..ab41586 100644
  
              @Override
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..e8d2390 100644
+index 19582f3..655ced9 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -1928,7 +1928,7 @@ index 19582f3..e8d2390 100644
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGpsDataRequest;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFileUploadInfo;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHeartRateZonesConfig;
-@@ -281,6 +283,476 @@ public class HuaweiSupportProvider {
+@@ -281,6 +283,496 @@ public class HuaweiSupportProvider {
      private boolean gpsEnabled = false;
      private Location gpsLastLocation;
  
@@ -1991,6 +1991,20 @@ index 19582f3..e8d2390 100644
 +    private static final long RRI_LIVENESS_GRACE_MS = 5 * 60 * 1000L;
 +    /** The long sleep pauses reach 12 min, so a reconnect is attempted at most this often. */
 +    private static final long RRI_LINK_DROP_COOLDOWN_MS = 10 * 60 * 1000L;
++    /**
++     * Local patch: how long the beat stream may be silent before the open request is sent
++     * again.
++     *
++     * Measured over one full night (2026-11-16): 5,644 packets, the largest gap between two
++     * consecutive 0x19/0x05 packets was 42 s. A stream that is quiet for 90 s has therefore
++     * really stopped, while one that is merely reporting no beats keeps sending empty
++     * packets (timestamp 0, all slots zero) and needs nothing.
++     *
++     * Re-opening every 15 s as before produced 1,304 writes per night, and 194 of the 236
++     * error answers on this channel (code 0x0001E84A) arrived within 10 s of one of them:
++     * the device was rejecting "open" on a stream that was already open.
++     */
++    private static final long RRI_REOPEN_AFTER_SILENCE_MS = 90 * 1000L;
 +    private long windowEnteredMs = 0L;
 +    private boolean rriOpenedThisWindow = false;
 +    private long lastLinkDropMs = 0L;
@@ -2008,18 +2022,24 @@ index 19582f3..e8d2390 100644
 +                if (windowEnteredMs == 0L) {
 +                    windowEnteredMs = now;
 +                }
-+                if (!rriOpenedThisWindow && now - windowEnteredMs > RRI_LIVENESS_GRACE_MS) {
-+                    // The stream never produced a packet in this window. Either the open request
-+                    // never landed or the link is dead; both are fixed by reconnecting.
++                // Every 0x19/0x05 arrival refreshes lastRriPacketMs, empty packets included,
++                // so this is "did the channel carry anything", not "did we get beats".
++                boolean heardSinceWindow = lastRriPacketMs >= windowEnteredMs;
++                long silenceMs = now - lastRriPacketMs;
++                if (!heardSinceWindow && now - windowEnteredMs > RRI_LIVENESS_GRACE_MS) {
++                    // Nothing at all since the window opened: the open request never landed or
++                    // the link is dead. Reconnecting is the fix for both.
 +                    LOG.info("RRI_LINKSTALE no packet since window start, dropping connection");
 +                    dropDeadLink(now);
 +                    windowEnteredMs = now;
-+                } else if (rriOpenedThisWindow && now - lastRriPacketMs > RRI_LIVENESS_MS) {
++                } else if (silenceMs > RRI_LIVENESS_MS) {
 +                    LOG.info("RRI_LINKSTALE last packet {}s ago, dropping connection",
-+                            (now - lastRriPacketMs) / 1000);
++                            silenceMs / 1000);
 +                    dropDeadLink(now);
 +                    windowEnteredMs = now;
-+                } else {
++                } else if (!heardSinceWindow || silenceMs > RRI_REOPEN_AFTER_SILENCE_MS) {
++                    // Ask again only when the channel is actually quiet. While the device is
++                    // streaming (even with empty packets) a new request is rejected.
 +                    openRriStream();
 +                }
 +            } else if (now - lastRriPacketMs < 120_000L && now - rriLastCloseMs > 300_000L) {
@@ -2405,7 +2425,7 @@ index 19582f3..e8d2390 100644
      private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
  
      protected ResponseManager responseManager = new ResponseManager(this);
-@@ -817,6 +1289,18 @@ public class HuaweiSupportProvider {
+@@ -817,6 +1309,18 @@ public class HuaweiSupportProvider {
              huaweiDataSyncManager.unregisterAll();
              this.huaweiDataSyncTreeCircleGoals = null;
              stopBatteryRunnerDelayed();
@@ -2424,7 +2444,7 @@ index 19582f3..e8d2390 100644
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +2100,54 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +2120,54 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
@@ -2479,7 +2499,7 @@ index 19582f3..e8d2390 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2756,66 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2776,66 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -2546,7 +2566,7 @@ index 19582f3..e8d2390 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3424,10 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3444,10 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -2557,7 +2577,7 @@ index 19582f3..e8d2390 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,14 +3574,19 @@ public class HuaweiSupportProvider {
+@@ -2978,14 +3594,19 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -2580,7 +2600,7 @@ index 19582f3..e8d2390 100644
              @Override
              public void syncComplete(byte[] statusData, byte[] sleepData) {
                  LOG.debug("Sync of TruSleep status and data finished");
-@@ -3014,24 +3615,252 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3635,252 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -2842,7 +2862,7 @@ index 19582f3..e8d2390 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +4134,30 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +4154,30 @@ public class HuaweiSupportProvider {
      }
  
  }
