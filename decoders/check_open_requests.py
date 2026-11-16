@@ -109,6 +109,8 @@ def main():
     ap.add_argument("csv")
     ap.add_argument("--pause-min", type=int, default=6,
                     help="shortest gap to report as a pause (default 6 s)")
+    ap.add_argument("--opens", action="store_true",
+                    help="list every open request with the silence that preceded it")
     ap.add_argument("--alive-window", type=int, default=120,
                     help="a LINKSTALE is a false positive if an inbound frame arrived this "
                          "many seconds before it (default 120)")
@@ -185,6 +187,20 @@ def main():
         print("  %s  %-58s %s" % (stamp(e), rest[:58], verdict))
     if stale:
         print("  -> %d of %d were false positives" % (wrong, len(stale)))
+
+    # ---- every open, with the silence that preceded it -----------------------
+    if args.opens and opens:
+        print("\nAll open requests, with the beat-channel silence before each")
+        print("%-14s %12s" % ("sent at", "silence before"))
+        prev = None
+        for t in opens:
+            e = epoch(t)
+            before = [x for x in received if epoch(x) <= e]
+            gap = (e - epoch(before[-1])) if before else None
+            print("%-14s %12s" % (stamp(e), "%d s" % gap if gap is not None else "none"))
+            prev = e
+        print("  (an open with a small silence before it means the stream had gone quiet,"
+              " so the earlier request did not hold)")
 
     # ---- how aggressively we re-open ------------------------------------------
     if opens:
