@@ -119,10 +119,10 @@ index 5bb5f45..abfac1a 100644
  }
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-index 096543c..bec092d 100644
+index 096543c..e17b30a 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-@@ -2,82 +2,1181 @@ package nodomain.freeyourgadget.gadgetbridge.database
+@@ -2,82 +2,1188 @@ package nodomain.freeyourgadget.gadgetbridge.database
  
  import android.content.Context
  import android.content.Intent
@@ -255,7 +255,14 @@ index 096543c..bec092d 100644
 +            } else {
 +                val nowSec = System.currentTimeMillis() / 1000
 +                val lastSec = readCursor(CURSOR_DELTA)
-+                val fromSec = if (lastSec == 0L) nowSec - 48 * 3600 else lastSec - 3600
++                // The lookback has to be longer than the gap between two database fills, not
++                // just longer than the gap between two exports. Activity rows reach the database
++                // in batches when the watch syncs (every 6 h); a row stamped 20:00 is inserted at
++                // 02:00. With a 1 h lookback the 00:00 export missed 20:00-23:00 entirely and the
++                // 12:00 export missed 08:00-11:00 — roughly six hours of heart rate, SpO2 and
++                // sleep-stage rows every day. Re-sent rows are harmless: the consumer
++                // deduplicates on the primary key.
++                val fromSec = if (lastSec == 0L) nowSec - 48 * 3600 else lastSec - 48 * 3600
 +
 +                // One stamp for the whole batch. Calling stamp() per file let the second tick
 +                // over in the middle of a run, which split one batch across two stamps.
@@ -1909,7 +1916,7 @@ index 583c919..ab41586 100644
  
              @Override
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..655ced9 100644
+index 19582f3..e60517f 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -1928,7 +1935,7 @@ index 19582f3..655ced9 100644
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGpsDataRequest;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFileUploadInfo;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHeartRateZonesConfig;
-@@ -281,6 +283,496 @@ public class HuaweiSupportProvider {
+@@ -281,6 +283,498 @@ public class HuaweiSupportProvider {
      private boolean gpsEnabled = false;
      private Location gpsLastLocation;
  
@@ -1943,7 +1950,9 @@ index 19582f3..655ced9 100644
 +     * when travelling instead of shifting by the UTC offset.
 +     */
 +    private static final int RRI_WINDOW_START_HOUR = 0;
-+    private static final int RRI_WINDOW_END_HOUR = 8;
++    // Experiment 2026-11-16: 04:00 instead of 08:00, to measure the cost of a shorter window
++    // and to leave the second half of the night for whatever the watch records by itself.
++    private static final int RRI_WINDOW_END_HOUR = 4;
 +
 +    private static boolean insideRriWindow() {
 +        int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
@@ -2425,7 +2434,7 @@ index 19582f3..655ced9 100644
      private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
  
      protected ResponseManager responseManager = new ResponseManager(this);
-@@ -817,6 +1309,18 @@ public class HuaweiSupportProvider {
+@@ -817,6 +1311,18 @@ public class HuaweiSupportProvider {
              huaweiDataSyncManager.unregisterAll();
              this.huaweiDataSyncTreeCircleGoals = null;
              stopBatteryRunnerDelayed();
@@ -2444,7 +2453,7 @@ index 19582f3..655ced9 100644
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +2120,54 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +2122,54 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
@@ -2499,7 +2508,7 @@ index 19582f3..655ced9 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2776,66 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2778,66 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -2566,7 +2575,7 @@ index 19582f3..655ced9 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3444,10 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3446,10 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -2577,7 +2586,7 @@ index 19582f3..655ced9 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,14 +3594,19 @@ public class HuaweiSupportProvider {
+@@ -2978,14 +3596,19 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -2600,7 +2609,7 @@ index 19582f3..655ced9 100644
              @Override
              public void syncComplete(byte[] statusData, byte[] sleepData) {
                  LOG.debug("Sync of TruSleep status and data finished");
-@@ -3014,24 +3635,252 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3637,252 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -2862,7 +2871,7 @@ index 19582f3..655ced9 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +4154,30 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +4156,30 @@ public class HuaweiSupportProvider {
      }
  
  }

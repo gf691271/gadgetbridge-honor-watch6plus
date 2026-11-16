@@ -1,0 +1,75 @@
+From 41d098607e9fa70e69c31f6733bbc4ad7aaed6be Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 11:51:33 +0800
+Subject: [PATCH] fix: the export lookback was shorter than the database fill
+ interval
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Activity rows reach the database in batches when the watch syncs (every 6 h), so a row
+stamped 20:00 is inserted at 02:00. The delta export looked back only 1 h, which meant the
+00:00 export skipped 20:00-23:00 and the 12:00 export skipped 08:00-11:00 — roughly six
+hours of heart rate, SpO2 and sleep-stage rows per day, never written to any CSV.
+
+The review of 2026-11-14 only fixed the failure path (a failed table must not advance the
+cursor); nobody checked whether the successful path looked back far enough.
+
+48 h instead of 1 h. Re-sent rows are harmless: the consumer deduplicates on the primary
+key, and a batch grows by a few thousand rows.
+
+Also in this build, for the 2026-11-16 experiment night only:
+- RRI_WINDOW_END_HOUR 8 -> 4, to price a shorter window and leave the second half of the
+  night to whatever the watch records by itself.
+
+Nightly battery measured from the exported BATTERY_LEVEL rows (00:00-08:00):
+  11-12  no stream, TruSleep off        1 %
+  11-13  no stream, TruSleep on         2 %   (and the blob for that night exists)
+  11-15  RRI stream 8 h                26 %
+i.e. recording the blob costs ~2 %/night and the live stream ~26 %/night: one order of
+magnitude apart. That is the strongest argument yet for getting the blob back.
+
+Compiled: assembleMainlineDebug BUILD_OK, installed.
+---
+ .../gadgetbridge/database/DatabaseExportWorker.kt        | 9 ++++++++-
+ .../service/devices/huawei/HuaweiSupportProvider.java    | 4 +++-
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+index bec092d..e17b30a 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+@@ -121,7 +121,14 @@ class DatabaseExportWorker(
+             } else {
+                 val nowSec = System.currentTimeMillis() / 1000
+                 val lastSec = readCursor(CURSOR_DELTA)
+-                val fromSec = if (lastSec == 0L) nowSec - 48 * 3600 else lastSec - 3600
++                // The lookback has to be longer than the gap between two database fills, not
++                // just longer than the gap between two exports. Activity rows reach the database
++                // in batches when the watch syncs (every 6 h); a row stamped 20:00 is inserted at
++                // 02:00. With a 1 h lookback the 00:00 export missed 20:00-23:00 entirely and the
++                // 12:00 export missed 08:00-11:00 — roughly six hours of heart rate, SpO2 and
++                // sleep-stage rows every day. Re-sent rows are harmless: the consumer
++                // deduplicates on the primary key.
++                val fromSec = if (lastSec == 0L) nowSec - 48 * 3600 else lastSec - 48 * 3600
+ 
+                 // One stamp for the whole batch. Calling stamp() per file let the second tick
+                 // over in the middle of a run, which split one batch across two stamps.
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index 655ced9..e60517f 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -294,7 +294,9 @@ public class HuaweiSupportProvider {
+      * when travelling instead of shifting by the UTC offset.
+      */
+     private static final int RRI_WINDOW_START_HOUR = 0;
+-    private static final int RRI_WINDOW_END_HOUR = 8;
++    // Experiment 2026-11-16: 04:00 instead of 08:00, to measure the cost of a shorter window
++    // and to leave the second half of the night for whatever the watch records by itself.
++    private static final int RRI_WINDOW_END_HOUR = 4;
+ 
+     private static boolean insideRriWindow() {
+         int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
+-- 
+2.55.0.windows.2
+
