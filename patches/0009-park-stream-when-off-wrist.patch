@@ -1,0 +1,205 @@
+From 3ec6667ccacd79f30c45850acb6c265124189a56 Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:10:20 +0800
+Subject: [PATCH] feat: park the beat stream when the watch is off the wrist
+
+The user charges the watch before bed, takes it off to shower, and falls asleep anywhere
+between 00:00 and 03:00, so a fixed clock window can never line up with their night. While
+the watch sits on the charger the link keeps carrying empty packets (timestamp 0, every
+slot rri=0) and an open stream still costs about 2.7 % of battery per hour.
+
+ResponseManager now tells the provider when a packet actually carried a beat
+(countRriPairs -> markRriBeat). The 15 s scheduler uses that:
+
+  a beat within the last 8 min      -> worn, keep the stream open
+  nothing for 8 min                 -> park: close the stream, then probe 3 min every 15 min
+  parked and no packet for 45 min   -> drop the link and start over
+
+The 45 min bound exists because a parked watch sends nothing by design; without it the
+15 min liveness rule would fire on our own close. A probe that gets a beat immediately
+returns the scheduler to normal.
+
+Battery estimate for a 6 h worn + 2 h charging night: ~17 % instead of 26 %; for a night
+that is never worn, ~5 % instead of 21 %. The real win is still the blob (2 %/night), but
+this keeps the expensive path from burning battery while the watch is on the charger.
+
+Checked with tools/simulate-rri-scheduler.py: worn all night -> one probe then steady, no
+churn; never worn -> 32 probes over 8 h (20 % duty); charging 2 h then worn -> resumes.
+Compiled: assembleMainlineDebug BUILD_OK.
+
+Not installed yet: the TruSleep experiment runs tonight and should not have its transport
+changed the same evening.
+---
+ .../devices/huawei/HuaweiSupportProvider.java | 80 ++++++++++++++++---
+ .../devices/huawei/ResponseManager.java       | 37 +++++++++
+ 2 files changed, 108 insertions(+), 9 deletions(-)
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index e60517f..4b88d9f 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -358,6 +358,30 @@ public class HuaweiSupportProvider {
+      * the device was rejecting "open" on a stream that was already open.
+      */
+     private static final long RRI_REOPEN_AFTER_SILENCE_MS = 90 * 1000L;
++
++    /**
++     * Local patch: the watch is not always on the wrist.
++     *
++     * Measured 2026-11-16: the user charges the watch before bed and takes it off to shower,
++     * and their bedtime moves between 00:00 and 03:00, so no clock window can cover it. While
++     * the watch is off the wrist the sensor reports no pulse but the link keeps carrying empty
++     * packets, and an open stream still costs about 2.7 % of battery per hour.
++     *
++     * So the stream is parked unless beats are actually arriving:
++     *   - a real beat within RRI_WEAR_SILENCE_MS  -> worn, keep the stream open
++     *   - nothing for that long                  -> park (close) and probe briefly every
++     *                                               RRI_PROBE_PERIOD_MS
++     * A probe opens the stream for RRI_PROBE_LENGTH_MS; if a beat arrives, the stream stays.
++     */
++    private static final long RRI_WEAR_SILENCE_MS = 8 * 60 * 1000L;
++    private static final long RRI_PROBE_PERIOD_MS = 15 * 60 * 1000L;
++    private static final long RRI_PROBE_LENGTH_MS = 3 * 60 * 1000L;
++    /** While parked the stream is closed on purpose, so the liveness rule needs its own bound. */
++    private static final long RRI_PARKED_LINK_TIMEOUT_MS = 45 * 60 * 1000L;
++    /** Wall clock of the last packet that carried at least one usable beat. */
++    private static volatile long lastRriBeatMs = 0L;
++    private long lastProbeMs = 0L;
++    private long probeStartedMs = 0L;
+     private long windowEnteredMs = 0L;
+     private boolean rriOpenedThisWindow = false;
+     private long lastLinkDropMs = 0L;
+@@ -367,6 +391,11 @@ public class HuaweiSupportProvider {
+         lastRriPacketMs = System.currentTimeMillis();
+     }
+ 
++    /** Called by ResponseManager when a packet actually contained at least one beat. */
++    public static void markRriBeat() {
++        lastRriBeatMs = System.currentTimeMillis();
++    }
++
+     private final Runnable rriRepeat = new Runnable() {
+         @Override
+         public void run() {
+@@ -379,21 +408,54 @@ public class HuaweiSupportProvider {
+                 // so this is "did the channel carry anything", not "did we get beats".
+                 boolean heardSinceWindow = lastRriPacketMs >= windowEnteredMs;
+                 long silenceMs = now - lastRriPacketMs;
++                final boolean offWrist = now - lastRriBeatMs > RRI_WEAR_SILENCE_MS;
+                 if (!heardSinceWindow && now - windowEnteredMs > RRI_LIVENESS_GRACE_MS) {
+                     // Nothing at all since the window opened: the open request never landed or
+                     // the link is dead. Reconnecting is the fix for both.
+                     LOG.info("RRI_LINKSTALE no packet since window start, dropping connection");
+                     dropDeadLink(now);
+                     windowEnteredMs = now;
+-                } else if (silenceMs > RRI_LIVENESS_MS) {
+-                    LOG.info("RRI_LINKSTALE last packet {}s ago, dropping connection",
+-                            silenceMs / 1000);
+-                    dropDeadLink(now);
+-                    windowEnteredMs = now;
+-                } else if (!heardSinceWindow || silenceMs > RRI_REOPEN_AFTER_SILENCE_MS) {
+-                    // Ask again only when the channel is actually quiet. While the device is
+-                    // streaming (even with empty packets) a new request is rejected.
+-                    openRriStream();
++                } else if (offWrist) {
++                    // Empty packets only: the watch is off the wrist. Park the stream so the
++                    // optical sensor and the radio can idle, and probe briefly now and then so
++                    // the night is picked up again when the watch goes back on.
++                    if (probeStartedMs != 0L && now - probeStartedMs > RRI_PROBE_LENGTH_MS) {
++                        LOG.info("RRI_WEAR parked, no beat within the {}s probe",
++                                RRI_PROBE_LENGTH_MS / 1000);
++                        closeRriStream();
++                        probeStartedMs = 0L;
++                    } else if (probeStartedMs == 0L && now - lastProbeMs > RRI_PROBE_PERIOD_MS) {
++                        LOG.info("RRI_WEAR probing (no beat for {}s)",
++                                (now - lastRriBeatMs) / 1000);
++                        lastProbeMs = now;
++                        probeStartedMs = now;
++                        openRriStream();
++                    } else if (silenceMs > RRI_PARKED_LINK_TIMEOUT_MS) {
++                        // Parked means we closed the stream ourselves, so the usual 15 min
++                        // liveness rule cannot apply. A link that has been completely silent for
++                        // this long is more likely dead than "still charging", and the campaign
++                        // has to survive it, so reconnect and start over.
++                        LOG.info("RRI_WEAR parked and no packet for {}s, dropping connection",
++                                silenceMs / 1000);
++                        dropDeadLink(now);
++                        windowEnteredMs = now;
++                        probeStartedMs = 0L;
++                        lastProbeMs = 0L;
++                    }
++                } else {
++                    // Worn: keep the stream open, and only ask again when it goes quiet.
++                    if (probeStartedMs != 0L) {
++                        probeStartedMs = 0L;
++                        lastProbeMs = 0L;
++                    }
++                    if (silenceMs > RRI_LIVENESS_MS) {
++                        LOG.info("RRI_LINKSTALE last packet {}s ago, dropping connection",
++                                silenceMs / 1000);
++                        dropDeadLink(now);
++                        windowEnteredMs = now;
++                    } else if (!heardSinceWindow || silenceMs > RRI_REOPEN_AFTER_SILENCE_MS) {
++                        openRriStream();
++                    }
+                 }
+             } else if (now - lastRriPacketMs < 120_000L && now - rriLastCloseMs > 300_000L) {
+                 // The device keeps streaming until told otherwise, so leaving the window
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
+index da8c024..b2f8f43 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
+@@ -288,6 +288,13 @@ public class ResponseManager {
+                             LOG.info("HRRRI_RAW len={} data={}", raw.length, hex);
+                             appendRriToFile(raw);
+                             HuaweiSupportProvider.markRriPacket();
++                            // A packet with no usable beat means the sensor has no pulse to
++                            // report, which in practice means the watch is off the wrist (or on
++                            // the charger). The stream scheduler uses this to stop paying for a
++                            // stream nobody is reading.
++                            if (countRriPairs(raw) > 0) {
++                                HuaweiSupportProvider.markRriBeat();
++                            }
+                         } else {
+                             LOG.info("HRRRI_RAW tlv=null class={}", receivedPacket.getClass().getSimpleName());
+                         }
+@@ -330,6 +337,36 @@ public class ResponseManager {
+      * Beats with sqi 0 are kept: dropping them would break the beat sequence, and the
+      * consumer can filter on the sqi column.
+      */
++    /** Number of usable (rri > 0) beats in this packet, without writing anything. */
++    private static int countRriPairs(byte[] raw) {
++        int n = 0;
++        boolean haveRri = false;
++        int i = 0;
++        while (i + 2 <= raw.length) {
++            int tag = raw[i] & 0xFF;
++            int len = raw[i + 1] & 0xFF;
++            int start = i + 2;
++            int end = start + len;
++            if (end > raw.length) {
++                break;
++            }
++            if (tag == 0x82 || tag == 0x83) {
++                i = start;
++                continue;
++            }
++            if (tag == 0x04 && len == 2) {
++                haveRri = (((raw[start] & 0xFF) << 8) | (raw[start + 1] & 0xFF)) > 0;
++            } else if (tag == 0x05 && len == 1) {
++                if (haveRri) {
++                    n++;
++                }
++                haveRri = false;
++            }
++            i = end;
++        }
++        return n;
++    }
++
+     private static void appendRriToFile(byte[] raw) {
+         try {
+             long ts = 0;
+-- 
+2.55.0.windows.2
+
