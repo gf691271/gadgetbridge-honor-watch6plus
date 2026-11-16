@@ -1,0 +1,64 @@
+From 214e21fe91ddb5401afc7d33f4fbefb82291bdaa Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:31:17 +0800
+Subject: [PATCH] feat: a switch to turn the beat stream off for one night
+
+The stream may contend with the watch's own sleep recording: while it is open the optical
+sensor is driven for us, and whether the watch still writes its raw blob in that state has
+never been tested. The night of 2026-11-16 therefore runs with the stream off and TruSleep
+on, one variable at a time.
+
+pref_rri_stream_enabled (device preference, default true) is checked at the top of
+insideRriWindow(), so turning it off disables the whole campaign at once: opening, the
+liveness watchdog, the off-wrist parking and the re-open logic all become no-ops.
+
+tools/rri-stream-switch.py flips it and reads the value back, so the state is verified
+rather than assumed.
+---
+ .../devices/huawei/HuaweiSupportProvider.java | 26 ++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index 4b88d9f..9c88841 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -298,11 +298,35 @@ public class HuaweiSupportProvider {
+     // and to leave the second half of the night for whatever the watch records by itself.
+     private static final int RRI_WINDOW_END_HOUR = 4;
+ 
+-    private static boolean insideRriWindow() {
++    private boolean insideRriWindow() {
++        if (!rriStreamEnabled()) {
++            return false;
++        }
+         int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
+         return hour >= RRI_WINDOW_START_HOUR && hour < RRI_WINDOW_END_HOUR;
+     }
+ 
++    /**
++     * Local patch: a switch to turn the whole beat-stream campaign off for one night.
++     *
++     * Needed because the stream may contend with the watch's own sleep recording: while it is
++     * open the optical sensor is being driven for the stream, and whether the watch still writes
++     * its own raw blob in that state has never been tested. Turning the stream off isolates the
++     * TruSleep experiment. Default true, so nothing changes unless the flag is set.
++     */
++    private boolean rriStreamEnabled() {
++        try {
++            if (gbDevice == null) {
++                return true;
++            }
++            return nodomain.freeyourgadget.gadgetbridge.GBApplication
++                    .getDeviceSpecificSharedPrefs(gbDevice.getAddress())
++                    .getBoolean("pref_rri_stream_enabled", true);
++        } catch (Exception e) {
++            return true;
++        }
++    }
++
+     /**
+      * Research scaffold switch. When true, every sync asks the device for all 17 known file
+      * ids and throws the answers away (only the size is logged). That list contains
+-- 
+2.55.0.windows.2
+

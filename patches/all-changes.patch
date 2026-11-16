@@ -1916,7 +1916,7 @@ index 583c919..ab41586 100644
  
              @Override
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..4b88d9f 100644
+index 19582f3..9c88841 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -1935,7 +1935,7 @@ index 19582f3..4b88d9f 100644
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGpsDataRequest;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFileUploadInfo;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHeartRateZonesConfig;
-@@ -281,6 +283,560 @@ public class HuaweiSupportProvider {
+@@ -281,6 +283,584 @@ public class HuaweiSupportProvider {
      private boolean gpsEnabled = false;
      private Location gpsLastLocation;
  
@@ -1954,9 +1954,33 @@ index 19582f3..4b88d9f 100644
 +    // and to leave the second half of the night for whatever the watch records by itself.
 +    private static final int RRI_WINDOW_END_HOUR = 4;
 +
-+    private static boolean insideRriWindow() {
++    private boolean insideRriWindow() {
++        if (!rriStreamEnabled()) {
++            return false;
++        }
 +        int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
 +        return hour >= RRI_WINDOW_START_HOUR && hour < RRI_WINDOW_END_HOUR;
++    }
++
++    /**
++     * Local patch: a switch to turn the whole beat-stream campaign off for one night.
++     *
++     * Needed because the stream may contend with the watch's own sleep recording: while it is
++     * open the optical sensor is being driven for the stream, and whether the watch still writes
++     * its own raw blob in that state has never been tested. Turning the stream off isolates the
++     * TruSleep experiment. Default true, so nothing changes unless the flag is set.
++     */
++    private boolean rriStreamEnabled() {
++        try {
++            if (gbDevice == null) {
++                return true;
++            }
++            return nodomain.freeyourgadget.gadgetbridge.GBApplication
++                    .getDeviceSpecificSharedPrefs(gbDevice.getAddress())
++                    .getBoolean("pref_rri_stream_enabled", true);
++        } catch (Exception e) {
++            return true;
++        }
 +    }
 +
 +    /**
@@ -2496,7 +2520,7 @@ index 19582f3..4b88d9f 100644
      private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
  
      protected ResponseManager responseManager = new ResponseManager(this);
-@@ -817,6 +1373,18 @@ public class HuaweiSupportProvider {
+@@ -817,6 +1397,18 @@ public class HuaweiSupportProvider {
              huaweiDataSyncManager.unregisterAll();
              this.huaweiDataSyncTreeCircleGoals = null;
              stopBatteryRunnerDelayed();
@@ -2515,7 +2539,7 @@ index 19582f3..4b88d9f 100644
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +2184,54 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +2208,54 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
@@ -2570,7 +2594,7 @@ index 19582f3..4b88d9f 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2840,66 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2864,66 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -2637,7 +2661,7 @@ index 19582f3..4b88d9f 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3508,10 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3532,10 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -2648,7 +2672,7 @@ index 19582f3..4b88d9f 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,14 +3658,19 @@ public class HuaweiSupportProvider {
+@@ -2978,14 +3682,19 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -2671,7 +2695,7 @@ index 19582f3..4b88d9f 100644
              @Override
              public void syncComplete(byte[] statusData, byte[] sleepData) {
                  LOG.debug("Sync of TruSleep status and data finished");
-@@ -3014,24 +3699,252 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3723,252 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -2933,7 +2957,7 @@ index 19582f3..4b88d9f 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +4218,30 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +4242,30 @@ public class HuaweiSupportProvider {
      }
  
  }
