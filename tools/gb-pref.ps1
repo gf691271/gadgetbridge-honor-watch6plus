@@ -1,4 +1,4 @@
-# gb-pref.ps1 — read or set a Gadgetbridge preference from adb.
+# gb-pref.ps1 - read or set a Gadgetbridge preference from adb.
 #
 # Written because two kinds of preference live in different files and both are needed
 # constantly: app-wide flags in nodomain.freeyourgadget.gadgetbridge_preferences.xml and
@@ -10,6 +10,13 @@
 #   .\tools\gb-pref.ps1 -Set general_autoconnectonbluetooth false
 #   .\tools\gb-pref.ps1 -Scope device -Get pref_research_file_probes
 #   .\tools\gb-pref.ps1 -Scope device -Set pref_keepalive_connect true
+#
+# SharedPreferences has two storage shapes and both must be handled:
+#   <string name="k">value</string>        element text
+#   <boolean name="k" value="true" />      attribute
+# An earlier version used one regex with an optional `value="..."` group, which could always
+# match by skipping the group, so -Get printed an empty line even when the key existed and
+# -List showed every boolean as empty. Read the tag first, then look for the value.
 #
 # Exit codes: 0 ok, 1 adb/device problem, 2 preference not found.
 
@@ -56,20 +63,35 @@ function Read-Prefs {
     return $raw
 }
 
+# One preference element -> its value, handling both the attribute and the element-text shape.
+function Get-ElementValue {
+    param([string]$Xml, [System.Text.RegularExpressions.Match]$Tag)
+    $attr = [regex]::Match($Tag.Value, 'value="([^"]*)"')
+    if ($attr.Success) { return $attr.Groups[1].Value }
+    if ($Tag.Value -match '/>$') { return '' }
+    $rest = $Xml.Substring($Tag.Index + $Tag.Length)
+    $end = $rest.IndexOf('<')
+    if ($end -lt 0) { return '' }
+    return $rest.Substring(0, $end)
+}
+
+$PREF_TAG = '<(?:boolean|string|int|long|float) name="([^"]+)"[^>]*>'
+
 if ($List) {
     $xml = Read-Prefs
-    [regex]::Matches($xml, '<(boolean|string|int|long|float) name="([^"]+)"[^>]*?(?:value="([^"]*)")?') |
-        ForEach-Object {
-            "{0,-52} = {1}" -f $_.Groups[2].Value, $_.Groups[3].Value
-        } | Sort-Object
+    [regex]::Matches($xml, $PREF_TAG) | ForEach-Object {
+        $name = $_.Groups[1].Value
+        $value = Get-ElementValue -Xml $xml -Tag $_
+        "{0,-52} = {1}" -f $name, $value
+    } | Sort-Object
     exit 0
 }
 
 if ($Get) {
     $xml = Read-Prefs
-    $m = [regex]::Match($xml, '<[a-z]+ name="' + [regex]::Escape($Get) + '"[^>/]*?(?:value="([^"]*)")?/?>')
-    if (-not $m.Success) { Write-Host "(absent: default applies)"; exit 2 }
-    Write-Output $m.Groups[1].Value
+    $tag = [regex]::Match($xml, '<(?:boolean|string|int|long|float) name="' + [regex]::Escape($Get) + '"[^>]*>')
+    if (-not $tag.Success) { Write-Host "(absent: default applies)"; exit 2 }
+    Write-Output (Get-ElementValue -Xml $xml -Tag $tag)
     exit 0
 }
 
