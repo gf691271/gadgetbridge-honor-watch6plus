@@ -1,0 +1,90 @@
+From 12a957e93a567596dde8e7a4980d5c26c41bad90 Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:19:42 +0800
+Subject: [PATCH] fix: keep collecting the blob while it grows; age out stale
+ manifests
+
+Two device findings from 2026-11-17 turned two assumptions over.
+
+1. The blob is not finished when it first becomes readable, and reading does not consume it.
+   Measured on the same night:
+     08:58 read -> 112,632 bytes, beats up to 08:11
+     14:08 read -> 119,548 bytes, beats up to 08:46
+   The watch kept appending for another 35 minutes after the first readable copy appeared,
+   and the earlier read did not destroy anything. So the morning retry no longer stops on the
+   first success: it keeps asking hourly until 13:00, and every distinct version is archived
+   (identical bytes are deduplicated by sha256, so a repeated read costs nothing).
+
+2. Manifests relocated for a schema bump were never pruned. They are renamed to
+   manifest-<stamp>.json.v<n>.stale, which no longer matches the batch pattern, so they
+   accumulated for ever. pruneBatches() now also recognises that suffix and ages them out on
+   the same KEEP_BATCH_DAYS rule.
+
+Device-verified this session:
+  - schema relocation: with export_schema.txt forced to 5, an export renamed all 10 existing
+    manifests to .v5.stale, left exactly one manifest-<stamp>.json, and wrote 6 to the marker
+  - retention: a planted 20-day-old manifest + CSV pair was deleted by the next export, and
+    the recent batches were untouched (231 CSVs before/after accounting for the new batch)
+  - sleep_state archival: 144 bytes saved twice, as sleep_state_<epoch_ms>.bin
+  - periodic sync back to 6 h: next fire 20:00
+
+Compiled: assembleMainlineDebug BUILD_OK, installed.
+---
+ .../gadgetbridge/database/DatabaseExportWorker.kt        | 5 +++++
+ .../service/devices/huawei/HuaweiSupportProvider.java    | 9 +++++++--
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+index 8a11f71..2cdaeaf 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+@@ -1106,9 +1106,14 @@ class DatabaseExportWorker(
+             val parser = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+             val kinds = DELTA_TABLES.joinToString("|") { Regex.escape(it.kind) }
+             val batchFile = Regex("^(?:manifest|$kinds)-(\\d{8}-\\d{6})\\.(?:json|csv)$")
++            // Manifests of an older schema are renamed to `manifest-<stamp>.json.v<n>.stale` so a
++            // consumer's `manifest-*.json` glob skips them. They still carry a stamp, so they age
++            // out on the same rule instead of accumulating for ever.
++            val staleManifest = Regex("^manifest-(\\d{8}-\\d{6})\\.json\\.v\\d+\\.stale$")
+             for ((name, doc) in listDocuments(location)) {
+                 val staleTmp = name.endsWith(".json.tmp") && name != "manifest-$currentBatch.json.tmp"
+                 val stampText = batchFile.matchEntire(name)?.groupValues?.get(1)
++                    ?: staleManifest.matchEntire(name)?.groupValues?.get(1)
+                 val expired = if (stampText == null || stampText == currentBatch) {
+                     false
+                 } else {
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index 3274e72..6abc1be 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -759,8 +759,11 @@ public class HuaweiSupportProvider {
+                                     return;
+                                 }
+                                 LOG.info("FULLDUMP sleep_data bytes={}", data.length);
+-                                sleepRetryCount = 0;
+-                                sleepRetryHandler.removeCallbacks(sleepRetry);
++                                // Do NOT stop here. Measured 2026-11-17: the first readable copy
++                                // (08:58, 112,632 B) covered beats up to 08:11, while a later read
++                                // (14:08, 119,548 B) covered up to 08:46 — the watch kept appending.
++                                // So the morning retries continue, and each distinct version is
++                                // archived (identical ones are deduplicated by sha256).
+                                 try {
+                                     java.io.File dir = new java.io.File(
+                                             getContext().getExternalFilesDir(null), "dump");
+@@ -769,11 +772,13 @@ public class HuaweiSupportProvider {
+                                 } catch (Exception e) {
+                                     LOG.error("FULLDUMP save failed", e);
+                                 }
++                                scheduleMorningRetry();
+                             }
+ 
+                             @Override
+                             public void downloadException(HuaweiFileDownloadManager.HuaweiFileDownloadException e) {
+                                 LOG.info("FULLDUMP sleep_data failed: {}", e.getMessage());
++                                scheduleMorningRetry();
+                             }
+                         }), false);
+         LOG.info("FULLDUMP requested {} -> {}", start, end);
+-- 
+2.55.0.windows.2
+

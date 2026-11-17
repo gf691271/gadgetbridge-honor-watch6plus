@@ -119,10 +119,10 @@ index 5bb5f45..abfac1a 100644
  }
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-index 096543c..8a11f71 100644
+index 096543c..2cdaeaf 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-@@ -2,82 +2,1257 @@ package nodomain.freeyourgadget.gadgetbridge.database
+@@ -2,82 +2,1262 @@ package nodomain.freeyourgadget.gadgetbridge.database
  
  import android.content.Context
  import android.content.Intent
@@ -1252,9 +1252,14 @@ index 096543c..8a11f71 100644
 +            val parser = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
 +            val kinds = DELTA_TABLES.joinToString("|") { Regex.escape(it.kind) }
 +            val batchFile = Regex("^(?:manifest|$kinds)-(\\d{8}-\\d{6})\\.(?:json|csv)$")
++            // Manifests of an older schema are renamed to `manifest-<stamp>.json.v<n>.stale` so a
++            // consumer's `manifest-*.json` glob skips them. They still carry a stamp, so they age
++            // out on the same rule instead of accumulating for ever.
++            val staleManifest = Regex("^manifest-(\\d{8}-\\d{6})\\.json\\.v\\d+\\.stale$")
 +            for ((name, doc) in listDocuments(location)) {
 +                val staleTmp = name.endsWith(".json.tmp") && name != "manifest-$currentBatch.json.tmp"
 +                val stampText = batchFile.matchEntire(name)?.groupValues?.get(1)
++                    ?: staleManifest.matchEntire(name)?.groupValues?.get(1)
 +                val expired = if (stampText == null || stampText == currentBatch) {
 +                    false
 +                } else {
@@ -2022,7 +2027,7 @@ index 583c919..ab41586 100644
  
              @Override
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..3274e72 100644
+index 19582f3..6abc1be 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -2041,7 +2046,7 @@ index 19582f3..3274e72 100644
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGpsDataRequest;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFileUploadInfo;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHeartRateZonesConfig;
-@@ -281,6 +283,639 @@ public class HuaweiSupportProvider {
+@@ -281,6 +283,644 @@ public class HuaweiSupportProvider {
      private boolean gpsEnabled = false;
      private Location gpsLastLocation;
  
@@ -2521,8 +2526,11 @@ index 19582f3..3274e72 100644
 +                                    return;
 +                                }
 +                                LOG.info("FULLDUMP sleep_data bytes={}", data.length);
-+                                sleepRetryCount = 0;
-+                                sleepRetryHandler.removeCallbacks(sleepRetry);
++                                // Do NOT stop here. Measured 2026-11-17: the first readable copy
++                                // (08:58, 112,632 B) covered beats up to 08:11, while a later read
++                                // (14:08, 119,548 B) covered up to 08:46 — the watch kept appending.
++                                // So the morning retries continue, and each distinct version is
++                                // archived (identical ones are deduplicated by sha256).
 +                                try {
 +                                    java.io.File dir = new java.io.File(
 +                                            getContext().getExternalFilesDir(null), "dump");
@@ -2531,11 +2539,13 @@ index 19582f3..3274e72 100644
 +                                } catch (Exception e) {
 +                                    LOG.error("FULLDUMP save failed", e);
 +                                }
++                                scheduleMorningRetry();
 +                            }
 +
 +                            @Override
 +                            public void downloadException(HuaweiFileDownloadManager.HuaweiFileDownloadException e) {
 +                                LOG.info("FULLDUMP sleep_data failed: {}", e.getMessage());
++                                scheduleMorningRetry();
 +                            }
 +                        }), false);
 +        LOG.info("FULLDUMP requested {} -> {}", start, end);
@@ -2681,7 +2691,7 @@ index 19582f3..3274e72 100644
      private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
  
      protected ResponseManager responseManager = new ResponseManager(this);
-@@ -817,6 +1452,18 @@ public class HuaweiSupportProvider {
+@@ -817,6 +1457,18 @@ public class HuaweiSupportProvider {
              huaweiDataSyncManager.unregisterAll();
              this.huaweiDataSyncTreeCircleGoals = null;
              stopBatteryRunnerDelayed();
@@ -2700,7 +2710,7 @@ index 19582f3..3274e72 100644
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +2263,54 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +2268,54 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
@@ -2755,7 +2765,7 @@ index 19582f3..3274e72 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2919,66 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2924,66 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -2822,7 +2832,7 @@ index 19582f3..3274e72 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3587,10 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3592,10 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -2833,7 +2843,7 @@ index 19582f3..3274e72 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,14 +3737,19 @@ public class HuaweiSupportProvider {
+@@ -2978,14 +3742,19 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -2856,7 +2866,7 @@ index 19582f3..3274e72 100644
              @Override
              public void syncComplete(byte[] statusData, byte[] sleepData) {
                  LOG.debug("Sync of TruSleep status and data finished");
-@@ -3014,24 +3778,264 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3783,264 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -3131,7 +3141,7 @@ index 19582f3..3274e72 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +4309,30 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +4314,30 @@ public class HuaweiSupportProvider {
      }
  
  }
