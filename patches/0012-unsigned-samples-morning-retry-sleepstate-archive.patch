@@ -1,0 +1,353 @@
+From 3fb1d7b04c240861c9198c0ce9781dee3e343490 Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:20:37 +0800
+Subject: [PATCH] fix: unsigned single-byte samples; retry the blob through the
+ morning
+
+Four items from the review, each verified or explicitly not verified.
+
+1. HEART_RATE / SPO / RESTING_HEART_RATE were read as signed bytes.
+
+   FitnessData.StepResponse.parseData assigns `value = data[i++]` (byte -> short) for the
+   single-byte tags, and the second bitmap does the same (`byte value = data[i++]`). A heart
+   rate of 130 (0x82) therefore became -126. Not theoretical: HUAWEI_ACTIVITY_SAMPLE on the
+   test device held -127/-124/-116/-109, i.e. 129/132/140/147 bpm, and its maximum was 125
+   because everything above 127 had been flipped. STEPS was already correct (two-byte path
+   masks both bytes).
+
+   Both sites now mask with 0xFF. TestFitnessDataSignHandling covers below-127, above-127,
+   0xFF, SpO2, resting HR and the parsedData value; 4 tests, all pass
+   (`testMainlineDebugUnitTest --tests *TestFitnessDataSignHandling*`).
+
+2. The raw sleep_state file is archived. Each segment is 16 bytes and the parser uses only
+   the first 8 (start, end); the other 8 have never been stored, so they could not be studied.
+   Saved next to the dumps as sleep_state_<epoch_ms>.bin.
+
+3. The blob is retried through the morning. On 2026-11-17 the session ended at 08:11 and the
+   08:00 periodic sync had already asked and received size 0; the night only survived because
+   a human reconnected at 08:58. Now an empty dump between 07:00 and 13:00 schedules another
+   attempt an hour later, up to 6 times.
+
+4. Manifests from an older schema are moved out of the `manifest-*.json` glob when the schema
+   is bumped: `export_schema.txt` remembers what this exporter last wrote, and the old files
+   are renamed to `manifest-<stamp>.json.v<old>.stale`. Not device-verified yet.
+
+Compiled: assembleMainlineDebug BUILD_OK. Unit test green. Not installed: the device dropped
+off adb during the install.
+---
+ .../database/DatabaseExportWorker.kt          | 53 +++++++++++
+ .../devices/huawei/packets/FitnessData.java   | 12 ++-
+ .../devices/huawei/HuaweiSupportProvider.java | 69 +++++++++++++-
+ .../packets/TestFitnessDataSignHandling.java  | 95 +++++++++++++++++++
+ 4 files changed, 225 insertions(+), 4 deletions(-)
+ create mode 100644 app/src/test/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/TestFitnessDataSignHandling.java
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+index 94fd228..8a11f71 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+@@ -136,6 +136,9 @@ class DatabaseExportWorker(
+ 
+                 val delta = exportDelta(location, fromSec, batch)
+                 val raw = copyRawBlobs(location)
++                // Before anything of this batch is visible: take manifests of an older schema
++                // out of the `manifest-*.json` glob so a consumer cannot pick one up.
++                relocateStaleManifests(location)
+                 val manifestOk = writeManifest(location, batch, delta, fromSec, nowSec, raw)
+                 // Move the cursor only when the batch is complete. The next run starts one
+                 // hour before the cursor, so a table that failed here would otherwise lose
+@@ -727,6 +730,56 @@ class DatabaseExportWorker(
+     }
+ 
+     /** Returns true when the manifest reached the export directory. */
++    /**
++     * Move manifests from an older schema out of the way.
++     *
++     * A consumer globs `manifest-*.json` and takes the newest. When the schema is bumped the old
++     * files stay in the directory and describe a different shape, which is exactly the kind of
++     * thing that turns into a silent mis-parse. So: keep the schema this exporter last wrote in
++     * `export_schema.txt`, and if it differs from the current constant, rename every existing
++     * manifest to `manifest-<stamp>.json.v<old>.stale` — out of the glob, still on disk.
++     */
++    private fun relocateStaleManifests(location: Uri) {
++        try {
++            val marker = java.io.File(mContext.getExternalFilesDir(null), "export_schema.txt")
++            val previous = try {
++                if (marker.exists()) marker.readText().trim().toInt() else 0
++            } catch (e: Exception) {
++                0
++            }
++            if (previous == SCHEMA_VERSION) {
++                return
++            }
++            if (previous != 0) {
++                var moved = 0
++                for (name in listDocuments(location).keys) {
++                    if (!name.startsWith("manifest-") || !name.endsWith(".json")) continue
++                    val target = "$name.v$previous.stale"
++                    try {
++                        val renamed = DocumentsContract.renameDocument(
++                            mContext.contentResolver, documentUri(location, name), target
++                        )
++                        if (renamed != null) {
++                            moved++
++                        }
++                    } catch (e: Exception) {
++                        LOG.warn("could not relocate {}: {}", name, e.message)
++                    }
++                }
++                LOG.info("Schema {} -> {}: relocated {} old manifests", previous, SCHEMA_VERSION, moved)
++            }
++            marker.writeText(SCHEMA_VERSION.toString())
++        } catch (e: Exception) {
++            LOG.warn("relocateStaleManifests failed", e)
++        }
++    }
++
++    /** Resolve tree/<name> directly. */
++    private fun documentUri(location: Uri, name: String): Uri =
++        DocumentsContract.buildDocumentUriUsingTree(
++            location, "${DocumentsContract.getTreeDocumentId(location)}/$name"
++        )
++
+     private fun writeManifest(
+         location: Uri,
+         batch: String,
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FitnessData.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FitnessData.java
+index d9074f3..105ffd3 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FitnessData.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FitnessData.java
+@@ -413,7 +413,8 @@ public class FitnessData {
+                 }
+             }
+ 
+-            private static void parseData(SubContainer returnValue, byte[] data) {
++            /** Package-visible so the sign handling can be unit tested. */
++            static void parseData(SubContainer returnValue, byte[] data) {
+                 int i = 0;
+ 
+                 if (data.length == 0) {
+@@ -448,7 +449,11 @@ public class FitnessData {
+                                 return;
+                             }
+ 
+-                            value = data[i++];
++                            // Values above 127 (a heart rate of 130 reads as 0x82) are unsigned
++                            // on the wire; without the mask Java sign-extends the byte and stores
++                            // -126. Seen in the field: four rows in HUAWEI_ACTIVITY_SAMPLE held
++                            // -127/-124/-116/-109, i.e. 129/132/140/147 bpm.
++                            value = (short) (data[i++] & 0xFF);
+                         } else {
+                             if (data.length - 2 < i) {
+                                 returnValue.parsedData = null;
+@@ -486,7 +491,8 @@ public class FitnessData {
+                                 return;
+                             }
+ 
+-                            byte value = data[i++];
++                            // Same mask as above: SpO2 and resting heart rate are unsigned bytes.
++                            short value = (short) (data[i++] & 0xFF);
+ 
+                             SubContainer.TV tv = new SubContainer.TV((byte) 2, (byte) bitToCheck, value);
+                             returnValue.parsedData.add(tv);
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index 9c88841..3274e72 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -755,9 +755,12 @@ public class HuaweiSupportProvider {
+                                     // Size 0 means the device had nothing for this window.
+                                     // An empty file must not replace the previous good dump.
+                                     LOG.info("FULLDUMP sleep_data empty, nothing saved");
++                                    scheduleMorningRetry();
+                                     return;
+                                 }
+                                 LOG.info("FULLDUMP sleep_data bytes={}", data.length);
++                                sleepRetryCount = 0;
++                                sleepRetryHandler.removeCallbacks(sleepRetry);
+                                 try {
+                                     java.io.File dir = new java.io.File(
+                                             getContext().getExternalFilesDir(null), "dump");
+@@ -776,6 +779,58 @@ public class HuaweiSupportProvider {
+         LOG.info("FULLDUMP requested {} -> {}", start, end);
+     }
+ 
++    /**
++     * Local patch: keep asking for the blob through the morning.
++     *
++     * Measured 2026-11-17: the sleep session ended at 08:11, but the 08:00 periodic sync had
++     * already asked and got size 0, because the watch only exposes the file once the session is
++     * closed. Without a retry the night is simply lost — the only reason the data exists is that
++     * a human reconnected at 08:58.
++     *
++     * So: if a dump comes back empty between 07:00 and 13:00, ask again in an hour, up to
++     * SLEEP_RETRY_MAX times. Nothing else paces this request, so the retry is not swallowed.
++     */
++    private static final int SLEEP_RETRY_MAX = 6;
++    private int sleepRetryCount = 0;
++    private final android.os.Handler sleepRetryHandler =
++            new android.os.Handler(android.os.Looper.getMainLooper());
++    private final Runnable sleepRetry = new Runnable() {
++        @Override
++        public void run() {
++            int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
++            if (hour < 7 || hour >= 13 || sleepRetryCount >= SLEEP_RETRY_MAX) {
++                LOG.info("FULLDUMP retry finished (hour={}, attempts={})", hour, sleepRetryCount);
++                return;
++            }
++            sleepRetryCount++;
++            LOG.info("FULLDUMP retrying in the morning, attempt {}", sleepRetryCount);
++            enqueueFullSleepDump();
++        }
++    };
++
++    /** Ask again in an hour; the watch exposes the blob only after the session closes. */
++    private void scheduleMorningRetry() {
++        sleepRetryHandler.removeCallbacks(sleepRetry);
++        sleepRetryHandler.postDelayed(sleepRetry, 60L * 60L * 1000L);
++    }
++
++    /** Archive a small raw file (sleep_state is a few dozen bytes) next to the dumps. */
++    private void saveSmallBlob(String name, byte[] payload) {
++        try {
++            java.io.File dir = new java.io.File(getContext().getExternalFilesDir(null), "dump");
++            if (!dir.exists() && !dir.mkdirs()) {
++                return;
++            }
++            java.io.File out = new java.io.File(dir, name + "_" + System.currentTimeMillis() + ".bin");
++            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
++                fos.write(payload);
++            }
++            LOG.info("SMALLBLOB saved {} bytes={}", out.getName(), payload.length);
++        } catch (Exception e) {
++            LOG.warn("SMALLBLOB {} failed: {}", name, e.getMessage());
++        }
++    }
++
+     /**
+      * Save one whole-window dump, unless it is byte-identical to the newest dump on disk,
+      * then delete all but the newest KEEP_SLEEP_DUMPS files. Every sync requests the same
+@@ -3732,7 +3787,19 @@ public class HuaweiSupportProvider {
+                 getDeviceState().getSupportsTruSleepNewSync(),
+                 wideStart,
+                 wideEnd,
+-                callback
++                new HuaweiTruSleepParser.SleepFileDownloadCallback(this, true) {
++                    @Override
++                    public void downloadComplete(HuaweiFileDownloadManager.FileRequest fr, @Nullable File raw) {
++                        // Local patch: keep the raw sleep_state file. Each segment is 16 bytes and
++                        // only the first 8 (start, end) are used by the parser; the other 8 have
++                        // never been stored anywhere, so they cannot be studied later.
++                        byte[] payload = fr.getData();
++                        if (payload != null && payload.length > 0) {
++                            saveSmallBlob("sleep_state", payload);
++                        }
++                        super.downloadComplete(fr, raw);
++                    }
++                }
+         ), true);
+         // Local patch: the sleep_data request that used to be queued here was removed.
+         // Its payload never reached a consumer (parseData/analyze are commented out
+diff --git a/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/TestFitnessDataSignHandling.java b/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/TestFitnessDataSignHandling.java
+new file mode 100644
+index 0000000..8e8787f
+--- /dev/null
++++ b/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/TestFitnessDataSignHandling.java
+@@ -0,0 +1,95 @@
++/*  Copyright (C) 2026 Gadgetbridge contributors
++
++    This file is part of Gadgetbridge.
++
++    Gadgetbridge is free software: you can redistribute it and/or modify
++    it under the terms of the GNU Affero General Public License as published
++    by the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    Gadgetbridge is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU Affero General Public License for more details.
++
++    You should have received a copy of the GNU Affero General Public License
++    along with this program.  If not, see <https://www.gnu.org/licenses/>. */
++package nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets;
++
++import org.junit.Assert;
++import org.junit.Test;
++
++/**
++ * The watch sends heart rate, SpO2 and resting heart rate as single unsigned bytes. Reading them
++ * into a signed {@code short} turns 130 bpm into -126, which is exactly what
++ * HUAWEI_ACTIVITY_SAMPLE contained for four rows before this was fixed
++ * (stored -127/-124/-116/-109, i.e. 129/132/140/147 bpm).
++ *
++ * Wire layout of one sample, as parseData() expects it:
++ *   byte 0  bitmap 1; bit 0x80 means "a second bitmap follows"
++ *   byte 1  bitmap 2 (only when bit 0x80 is set in bitmap 1)
++ *   then one value per set bit of bitmap 1, in bit order
++ *   then one value per set bit of bitmap 2, in bit order
++ *
++ * In bitmap 1 the single-byte tags are 0x20 and 0x40; 0x40 is heart rate.
++ * In bitmap 2 the single-byte tags are 0x01 (SpO2) and 0x02 (resting heart rate).
++ */
++public class TestFitnessDataSignHandling {
++
++    private static final byte HR_BIT = 0x40;
++    private static final byte SECOND_BITMAP_FLAG = (byte) 0x80;
++
++    private static FitnessData.MessageData.StepResponse.SubContainer parse(
++            byte heartRate, byte spo, byte restingHeartRate) {
++        byte[] data = new byte[]{
++                (byte) (HR_BIT | SECOND_BITMAP_FLAG),   // bitmap 1: heart rate + "another follows"
++                0x03,                                    // bitmap 2: SpO2 | resting HR
++                heartRate,
++                spo,
++                restingHeartRate
++        };
++        FitnessData.MessageData.StepResponse.SubContainer container =
++                new FitnessData.MessageData.StepResponse.SubContainer();
++        FitnessData.MessageData.StepResponse.parseData(container, data);
++        // parsedDataError defaults to "" (not null); a rejection always carries a message.
++        Assert.assertTrue("parseData rejected the sample: " + container.parsedDataError,
++                container.parsedDataError == null || container.parsedDataError.isEmpty());
++        return container;
++    }
++
++    @Test
++    public void heartRateBelow128IsUnchanged() {
++        Assert.assertEquals(72, parse((byte) 72, (byte) 97, (byte) 55).heartrate);
++    }
++
++    @Test
++    public void heartRateAbove127IsNotNegative() {
++        // 0x82 = 130 bpm. A signed read stores -126.
++        Assert.assertEquals(130, parse((byte) 0x82, (byte) 97, (byte) 55).heartrate);
++        // 0xFF is the extreme case: signed gives -1, which is also the "no data" sentinel, so the
++        // two would be indistinguishable downstream.
++        Assert.assertEquals(255, parse((byte) 0xFF, (byte) 97, (byte) 55).heartrate);
++    }
++
++    @Test
++    public void spoAndRestingHeartRateAreUnsignedToo() {
++        FitnessData.MessageData.StepResponse.SubContainer c =
++                parse((byte) 90, (byte) 0x80, (byte) 0xFF);
++        Assert.assertEquals(128, c.spo);
++        Assert.assertEquals(255, c.restingHeartRate);
++    }
++
++    @Test
++    public void parsedDataCarriesTheUnsignedValue() {
++        FitnessData.MessageData.StepResponse.SubContainer c =
++                parse((byte) 0x90, (byte) 97, (byte) 55);   // 0x90 = 144 bpm
++        boolean seen = false;
++        for (FitnessData.MessageData.StepResponse.SubContainer.TV tv : c.parsedData) {
++            if (tv.bitmap == 1 && tv.tag == HR_BIT) {
++                Assert.assertEquals(144, tv.value);
++                seen = true;
++            }
++        }
++        Assert.assertTrue("heart rate tag missing from parsedData", seen);
++    }
++}
+-- 
+2.55.0.windows.2
+

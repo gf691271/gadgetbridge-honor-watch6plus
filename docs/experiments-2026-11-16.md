@@ -383,3 +383,50 @@ R2（切 OFF 重连再读）才是判决步。
 
 `D:\deepseek\fable-handoff\`（zip 同目录）：blob 样本 ×3、全部解码器、字段布局文档、
 待确认问题、`rerun-all.py`（6 步全过）。
+
+---
+
+## 12. 复核第 15 条的六项（2026-11-17 下午）
+
+### 12.1 单字节采样是有符号读的（已修，有生产数据为证）
+
+`FitnessData.MessageData.StepResponse.parseData` 里两处 `data[i++]` 直接赋给 `short`/`byte`：
+单字节标签（0x20、0x40=心率）与第二张位图（0x01=血氧、0x02=静息心率）。
+
+库里的证据：
+
+```
+HEART_RATE n=28275  min=-127  max=125   值 < -1：4 行（-127/-124/-116/-109 = 129/132/140/147 bpm）
+SPO / RESTING_HEART_RATE / STEPS   值 < -1：0 行
+128 以上一个都没有 —— 全被翻成负数
+```
+
+**步数不受影响**（两字节路径两个字节都 mask 了）。
+两处都加了 `& 0xFF`；新增 `TestFitnessDataSignHandling`，4 个用例全过。
+
+### 12.2 分期行是事件，而且有两个生产者
+
+- 每个段写**两行**（`start→end` 与 `end→start`），镜像行的 `end - start` 是负数。
+  消费端必须只取 `OTHER_TIMESTAMP > TIMESTAMP`。
+- **`0x0D`**（`GetSleepDataRequest`）= 细粒度分期，含 **kind 7 深睡**
+- **`0x0A`**（`sleep_state.bin`）= **只有 kind 6**
+
+| 夜 | TruSleep | kind 6 来源 | kind 7 | kind 8 |
+|---|---|---|---|---|
+| 11-14→15 | OFF | 全 0x0D | 15 | 4 |
+| 11-15→16 | OFF | 全 0x0D | 16 | 4 |
+| **11-16→17** | **ON** | **0x0A** | **0** | 14（全 1 分钟） |
+
+**TruSleep=ON 的夜晚深睡完全消失，REM 退化成 1 分钟碎片，
+剩一个 290 分钟的「浅睡」大块（02:13→07:03）。** 这是开 TruSleep 的代价。
+
+### 12.3 上午重试（已实现，未真机验证）
+
+`enqueueFullSleepDump` 拿到 0 且本地时间在 07:00–13:00 时，一小时后重试，最多 6 次。
+起因：08:00 同步读到 0，会话 08:11 才结束，靠人 08:58 手动重连才拿到。
+周期同步已从 24 小时改回 6 小时。
+
+### 12.4 独立重算（结果一致）
+
+`fable-handoff/scripts/independent-check.py` 不 import 任何 decoder，结果与解码器逐项一致；
+两处 0.1 的差异来自「平均心率」的分母（首末拍跨度 vs PPG 记录跨度）。

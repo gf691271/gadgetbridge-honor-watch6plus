@@ -119,10 +119,10 @@ index 5bb5f45..abfac1a 100644
  }
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-index 096543c..94fd228 100644
+index 096543c..8a11f71 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-@@ -2,82 +2,1204 @@ package nodomain.freeyourgadget.gadgetbridge.database
+@@ -2,82 +2,1257 @@ package nodomain.freeyourgadget.gadgetbridge.database
  
  import android.content.Context
  import android.content.Intent
@@ -270,6 +270,9 @@ index 096543c..94fd228 100644
 +
 +                val delta = exportDelta(location, fromSec, batch)
 +                val raw = copyRawBlobs(location)
++                // Before anything of this batch is visible: take manifests of an older schema
++                // out of the `manifest-*.json` glob so a consumer cannot pick one up.
++                relocateStaleManifests(location)
 +                val manifestOk = writeManifest(location, batch, delta, fromSec, nowSec, raw)
 +                // Move the cursor only when the batch is complete. The next run starts one
 +                // hour before the cursor, so a table that failed here would otherwise lose
@@ -497,7 +500,7 @@ index 096543c..94fd228 100644
 +            parts.add("COUNT(DISTINCT ${it.first})")
 +            parts.add("MIN(${it.first})")
 +            parts.add("MAX(${it.first})")
-         }
++        }
 +        val out = mutableListOf<ColStat>()
 +        try {
 +            db.rawQuery("SELECT ${parts.joinToString(",")} FROM ${spec.table}$whereSql", null).use { c ->
@@ -518,8 +521,7 @@ index 096543c..94fd228 100644
 +        }
 +        return out
 +    }
- 
--        LOG.info("Broadcasting database export success={}", success)
++
 +    private fun qualityJson(rows: Int, stats: List<ColStat>, gaps: List<Long>): JsonObject {
 +        val q = JsonObject()
 +        q.addProperty("rows", rows)
@@ -536,10 +538,7 @@ index 096543c..94fd228 100644
 +        }
 +        return q
 +    }
- 
--        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
--        val exportedNotifyIntent = Intent(action)
--        mContext.sendBroadcast(exportedNotifyIntent)
++
 +    private fun csvCell(c: Cursor, index: Int): String {
 +        return when (c.getType(index)) {
 +            Cursor.FIELD_TYPE_NULL -> ""
@@ -873,6 +872,56 @@ index 096543c..94fd228 100644
 +    }
 +
 +    /** Returns true when the manifest reached the export directory. */
++    /**
++     * Move manifests from an older schema out of the way.
++     *
++     * A consumer globs `manifest-*.json` and takes the newest. When the schema is bumped the old
++     * files stay in the directory and describe a different shape, which is exactly the kind of
++     * thing that turns into a silent mis-parse. So: keep the schema this exporter last wrote in
++     * `export_schema.txt`, and if it differs from the current constant, rename every existing
++     * manifest to `manifest-<stamp>.json.v<old>.stale` — out of the glob, still on disk.
++     */
++    private fun relocateStaleManifests(location: Uri) {
++        try {
++            val marker = java.io.File(mContext.getExternalFilesDir(null), "export_schema.txt")
++            val previous = try {
++                if (marker.exists()) marker.readText().trim().toInt() else 0
++            } catch (e: Exception) {
++                0
++            }
++            if (previous == SCHEMA_VERSION) {
++                return
++            }
++            if (previous != 0) {
++                var moved = 0
++                for (name in listDocuments(location).keys) {
++                    if (!name.startsWith("manifest-") || !name.endsWith(".json")) continue
++                    val target = "$name.v$previous.stale"
++                    try {
++                        val renamed = DocumentsContract.renameDocument(
++                            mContext.contentResolver, documentUri(location, name), target
++                        )
++                        if (renamed != null) {
++                            moved++
++                        }
++                    } catch (e: Exception) {
++                        LOG.warn("could not relocate {}: {}", name, e.message)
++                    }
++                }
++                LOG.info("Schema {} -> {}: relocated {} old manifests", previous, SCHEMA_VERSION, moved)
++            }
++            marker.writeText(SCHEMA_VERSION.toString())
++        } catch (e: Exception) {
++            LOG.warn("relocateStaleManifests failed", e)
++        }
++    }
++
++    /** Resolve tree/<name> directly. */
++    private fun documentUri(location: Uri, name: String): Uri =
++        DocumentsContract.buildDocumentUriUsingTree(
++            location, "${DocumentsContract.getTreeDocumentId(location)}/$name"
++        )
++
 +    private fun writeManifest(
 +        location: Uri,
 +        batch: String,
@@ -1035,9 +1084,10 @@ index 096543c..94fd228 100644
 +        } catch (e: Exception) {
 +            LOG.error("Failed writing manifest", e)
 +            return false
-+        }
+         }
 +    }
-+
+ 
+-        LOG.info("Broadcasting database export success={}", success)
 +    /**
 +     * A visible manifest tells the consumer that the batch is complete, so it must never be
 +     * visible half-written: write it under a temporary name, then rename it. If the provider
@@ -1076,7 +1126,10 @@ index 096543c..94fd228 100644
 +            out.write(bytes)
 +        }
 +    }
-+
+ 
+-        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
+-        val exportedNotifyIntent = Intent(action)
+-        mContext.sendBroadcast(exportedNotifyIntent)
 +    private fun deviceJson(db: android.database.sqlite.SQLiteDatabase): JsonObject {
 +        val o = JsonObject()
 +        try {
@@ -1478,6 +1531,43 @@ index 368bb63..7d9ad9f 100644
          }
  
          public static class Response extends HuaweiPacket {
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FitnessData.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FitnessData.java
+index d9074f3..105ffd3 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FitnessData.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/FitnessData.java
+@@ -413,7 +413,8 @@ public class FitnessData {
+                 }
+             }
+ 
+-            private static void parseData(SubContainer returnValue, byte[] data) {
++            /** Package-visible so the sign handling can be unit tested. */
++            static void parseData(SubContainer returnValue, byte[] data) {
+                 int i = 0;
+ 
+                 if (data.length == 0) {
+@@ -448,7 +449,11 @@ public class FitnessData {
+                                 return;
+                             }
+ 
+-                            value = data[i++];
++                            // Values above 127 (a heart rate of 130 reads as 0x82) are unsigned
++                            // on the wire; without the mask Java sign-extends the byte and stores
++                            // -126. Seen in the field: four rows in HUAWEI_ACTIVITY_SAMPLE held
++                            // -127/-124/-116/-109, i.e. 129/132/140/147 bpm.
++                            value = (short) (data[i++] & 0xFF);
+                         } else {
+                             if (data.length - 2 < i) {
+                                 returnValue.parsedData = null;
+@@ -486,7 +491,8 @@ public class FitnessData {
+                                 return;
+                             }
+ 
+-                            byte value = data[i++];
++                            // Same mask as above: SpO2 and resting heart rate are unsigned bytes.
++                            short value = (short) (data[i++] & 0xFF);
+ 
+                             SubContainer.TV tv = new SubContainer.TV((byte) 2, (byte) bitToCheck, value);
+                             returnValue.parsedData.add(tv);
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/Workout.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/Workout.java
 index 3e715d7..7f26316 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/Workout.java
@@ -1932,7 +2022,7 @@ index 583c919..ab41586 100644
  
              @Override
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..9c88841 100644
+index 19582f3..3274e72 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -1951,7 +2041,7 @@ index 19582f3..9c88841 100644
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendGpsDataRequest;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendFileUploadInfo;
  import nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests.SendHeartRateZonesConfig;
-@@ -281,6 +283,584 @@ public class HuaweiSupportProvider {
+@@ -281,6 +283,639 @@ public class HuaweiSupportProvider {
      private boolean gpsEnabled = false;
      private Location gpsLastLocation;
  
@@ -2427,9 +2517,12 @@ index 19582f3..9c88841 100644
 +                                    // Size 0 means the device had nothing for this window.
 +                                    // An empty file must not replace the previous good dump.
 +                                    LOG.info("FULLDUMP sleep_data empty, nothing saved");
++                                    scheduleMorningRetry();
 +                                    return;
 +                                }
 +                                LOG.info("FULLDUMP sleep_data bytes={}", data.length);
++                                sleepRetryCount = 0;
++                                sleepRetryHandler.removeCallbacks(sleepRetry);
 +                                try {
 +                                    java.io.File dir = new java.io.File(
 +                                            getContext().getExternalFilesDir(null), "dump");
@@ -2446,6 +2539,58 @@ index 19582f3..9c88841 100644
 +                            }
 +                        }), false);
 +        LOG.info("FULLDUMP requested {} -> {}", start, end);
++    }
++
++    /**
++     * Local patch: keep asking for the blob through the morning.
++     *
++     * Measured 2026-11-17: the sleep session ended at 08:11, but the 08:00 periodic sync had
++     * already asked and got size 0, because the watch only exposes the file once the session is
++     * closed. Without a retry the night is simply lost — the only reason the data exists is that
++     * a human reconnected at 08:58.
++     *
++     * So: if a dump comes back empty between 07:00 and 13:00, ask again in an hour, up to
++     * SLEEP_RETRY_MAX times. Nothing else paces this request, so the retry is not swallowed.
++     */
++    private static final int SLEEP_RETRY_MAX = 6;
++    private int sleepRetryCount = 0;
++    private final android.os.Handler sleepRetryHandler =
++            new android.os.Handler(android.os.Looper.getMainLooper());
++    private final Runnable sleepRetry = new Runnable() {
++        @Override
++        public void run() {
++            int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
++            if (hour < 7 || hour >= 13 || sleepRetryCount >= SLEEP_RETRY_MAX) {
++                LOG.info("FULLDUMP retry finished (hour={}, attempts={})", hour, sleepRetryCount);
++                return;
++            }
++            sleepRetryCount++;
++            LOG.info("FULLDUMP retrying in the morning, attempt {}", sleepRetryCount);
++            enqueueFullSleepDump();
++        }
++    };
++
++    /** Ask again in an hour; the watch exposes the blob only after the session closes. */
++    private void scheduleMorningRetry() {
++        sleepRetryHandler.removeCallbacks(sleepRetry);
++        sleepRetryHandler.postDelayed(sleepRetry, 60L * 60L * 1000L);
++    }
++
++    /** Archive a small raw file (sleep_state is a few dozen bytes) next to the dumps. */
++    private void saveSmallBlob(String name, byte[] payload) {
++        try {
++            java.io.File dir = new java.io.File(getContext().getExternalFilesDir(null), "dump");
++            if (!dir.exists() && !dir.mkdirs()) {
++                return;
++            }
++            java.io.File out = new java.io.File(dir, name + "_" + System.currentTimeMillis() + ".bin");
++            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
++                fos.write(payload);
++            }
++            LOG.info("SMALLBLOB saved {} bytes={}", out.getName(), payload.length);
++        } catch (Exception e) {
++            LOG.warn("SMALLBLOB {} failed: {}", name, e.getMessage());
++        }
 +    }
 +
 +    /**
@@ -2536,7 +2681,7 @@ index 19582f3..9c88841 100644
      private final HuaweiPacket.ParamsProvider paramsProvider = new HuaweiPacket.ParamsProvider();
  
      protected ResponseManager responseManager = new ResponseManager(this);
-@@ -817,6 +1397,18 @@ public class HuaweiSupportProvider {
+@@ -817,6 +1452,18 @@ public class HuaweiSupportProvider {
              huaweiDataSyncManager.unregisterAll();
              this.huaweiDataSyncTreeCircleGoals = null;
              stopBatteryRunnerDelayed();
@@ -2555,7 +2700,7 @@ index 19582f3..9c88841 100644
              GetBatteryLevelRequest batteryLevelReq = new GetBatteryLevelRequest(this);
              batteryLevelReq.setFinalizeReq(new RequestCallback() {
                  @Override
-@@ -1616,6 +2208,54 @@ public class HuaweiSupportProvider {
+@@ -1616,6 +2263,54 @@ public class HuaweiSupportProvider {
      }
  
      public void onFetchRecordedData(int dataTypes) {
@@ -2610,7 +2755,7 @@ index 19582f3..9c88841 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2864,66 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2919,66 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -2677,7 +2822,7 @@ index 19582f3..9c88841 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3532,10 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3587,10 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -2688,7 +2833,7 @@ index 19582f3..9c88841 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,14 +3682,19 @@ public class HuaweiSupportProvider {
+@@ -2978,14 +3737,19 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -2711,7 +2856,7 @@ index 19582f3..9c88841 100644
              @Override
              public void syncComplete(byte[] statusData, byte[] sleepData) {
                  LOG.debug("Sync of TruSleep status and data finished");
-@@ -3014,24 +3723,252 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3778,264 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -2730,9 +2875,22 @@ index 19582f3..9c88841 100644
 -                getDeviceState().getSupportsTruSleepNewSync(),
 -                start,
 -                end,
+-                callback
 +                wideStart,
 +                wideEnd,
-                 callback
++                new HuaweiTruSleepParser.SleepFileDownloadCallback(this, true) {
++                    @Override
++                    public void downloadComplete(HuaweiFileDownloadManager.FileRequest fr, @Nullable File raw) {
++                        // Local patch: keep the raw sleep_state file. Each segment is 16 bytes and
++                        // only the first 8 (start, end) are used by the parser; the other 8 have
++                        // never been stored anywhere, so they cannot be studied later.
++                        byte[] payload = fr.getData();
++                        if (payload != null && payload.length > 0) {
++                            saveSmallBlob("sleep_state", payload);
++                        }
++                        super.downloadComplete(fr, raw);
++                    }
++                }
          ), true);
 +        // Local patch: the sleep_data request that used to be queued here was removed.
 +        // Its payload never reached a consumer (parseData/analyze are commented out
@@ -2973,7 +3131,7 @@ index 19582f3..9c88841 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +4242,30 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +4309,30 @@ public class HuaweiSupportProvider {
      }
  
  }
@@ -4581,3 +4739,104 @@ index 0000000..c7d78ac
 +        android:title="@string/pref_periodic_sync_title" />
 +
 +</PreferenceScreen>
+diff --git a/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/TestFitnessDataSignHandling.java b/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/TestFitnessDataSignHandling.java
+new file mode 100644
+index 0000000..8e8787f
+--- /dev/null
++++ b/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/TestFitnessDataSignHandling.java
+@@ -0,0 +1,95 @@
++/*  Copyright (C) 2026 Gadgetbridge contributors
++
++    This file is part of Gadgetbridge.
++
++    Gadgetbridge is free software: you can redistribute it and/or modify
++    it under the terms of the GNU Affero General Public License as published
++    by the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    Gadgetbridge is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU Affero General Public License for more details.
++
++    You should have received a copy of the GNU Affero General Public License
++    along with this program.  If not, see <https://www.gnu.org/licenses/>. */
++package nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets;
++
++import org.junit.Assert;
++import org.junit.Test;
++
++/**
++ * The watch sends heart rate, SpO2 and resting heart rate as single unsigned bytes. Reading them
++ * into a signed {@code short} turns 130 bpm into -126, which is exactly what
++ * HUAWEI_ACTIVITY_SAMPLE contained for four rows before this was fixed
++ * (stored -127/-124/-116/-109, i.e. 129/132/140/147 bpm).
++ *
++ * Wire layout of one sample, as parseData() expects it:
++ *   byte 0  bitmap 1; bit 0x80 means "a second bitmap follows"
++ *   byte 1  bitmap 2 (only when bit 0x80 is set in bitmap 1)
++ *   then one value per set bit of bitmap 1, in bit order
++ *   then one value per set bit of bitmap 2, in bit order
++ *
++ * In bitmap 1 the single-byte tags are 0x20 and 0x40; 0x40 is heart rate.
++ * In bitmap 2 the single-byte tags are 0x01 (SpO2) and 0x02 (resting heart rate).
++ */
++public class TestFitnessDataSignHandling {
++
++    private static final byte HR_BIT = 0x40;
++    private static final byte SECOND_BITMAP_FLAG = (byte) 0x80;
++
++    private static FitnessData.MessageData.StepResponse.SubContainer parse(
++            byte heartRate, byte spo, byte restingHeartRate) {
++        byte[] data = new byte[]{
++                (byte) (HR_BIT | SECOND_BITMAP_FLAG),   // bitmap 1: heart rate + "another follows"
++                0x03,                                    // bitmap 2: SpO2 | resting HR
++                heartRate,
++                spo,
++                restingHeartRate
++        };
++        FitnessData.MessageData.StepResponse.SubContainer container =
++                new FitnessData.MessageData.StepResponse.SubContainer();
++        FitnessData.MessageData.StepResponse.parseData(container, data);
++        // parsedDataError defaults to "" (not null); a rejection always carries a message.
++        Assert.assertTrue("parseData rejected the sample: " + container.parsedDataError,
++                container.parsedDataError == null || container.parsedDataError.isEmpty());
++        return container;
++    }
++
++    @Test
++    public void heartRateBelow128IsUnchanged() {
++        Assert.assertEquals(72, parse((byte) 72, (byte) 97, (byte) 55).heartrate);
++    }
++
++    @Test
++    public void heartRateAbove127IsNotNegative() {
++        // 0x82 = 130 bpm. A signed read stores -126.
++        Assert.assertEquals(130, parse((byte) 0x82, (byte) 97, (byte) 55).heartrate);
++        // 0xFF is the extreme case: signed gives -1, which is also the "no data" sentinel, so the
++        // two would be indistinguishable downstream.
++        Assert.assertEquals(255, parse((byte) 0xFF, (byte) 97, (byte) 55).heartrate);
++    }
++
++    @Test
++    public void spoAndRestingHeartRateAreUnsignedToo() {
++        FitnessData.MessageData.StepResponse.SubContainer c =
++                parse((byte) 90, (byte) 0x80, (byte) 0xFF);
++        Assert.assertEquals(128, c.spo);
++        Assert.assertEquals(255, c.restingHeartRate);
++    }
++
++    @Test
++    public void parsedDataCarriesTheUnsignedValue() {
++        FitnessData.MessageData.StepResponse.SubContainer c =
++                parse((byte) 0x90, (byte) 97, (byte) 55);   // 0x90 = 144 bpm
++        boolean seen = false;
++        for (FitnessData.MessageData.StepResponse.SubContainer.TV tv : c.parsedData) {
++            if (tv.bitmap == 1 && tv.tag == HR_BIT) {
++                Assert.assertEquals(144, tv.value);
++                seen = true;
++            }
++        }
++        Assert.assertTrue("heart rate tag missing from parsedData", seen);
++    }
++}
