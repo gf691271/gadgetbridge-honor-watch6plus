@@ -200,7 +200,7 @@ if (!getDeviceState().supportsTruSleep())
 HUAWEI_ACTIVITY_SAMPLE 共 2064 条
   kind=-1 (无数据)  1984
   kind=1  (活动)      66
-  kind=8  (REM)        6
+  kind=8  (未知类型)    6
   kind=6  (浅睡)       6
   kind=3               2
 ```

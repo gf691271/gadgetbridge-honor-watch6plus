@@ -119,10 +119,10 @@ index 5bb5f45..abfac1a 100644
  }
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-index 096543c..2cdaeaf 100644
+index 096543c..c197447 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-@@ -2,82 +2,1262 @@ package nodomain.freeyourgadget.gadgetbridge.database
+@@ -2,82 +2,1278 @@ package nodomain.freeyourgadget.gadgetbridge.database
  
  import android.content.Context
  import android.content.Intent
@@ -435,10 +435,11 @@ index 096543c..2cdaeaf 100644
 +                    }
 +                }
 +            }
-+        }
+         }
 +        return DeltaResult(written, failed)
 +    }
-+
+ 
+-        LOG.info("Broadcasting database export success={}", success)
 +    /**
 +     * Primary key columns in key order, read from the schema. A hand-kept list drifts: the
 +     * old one gave HUAWEI_ACTIVITY_SAMPLE as (TIMESTAMP, OTHER_TIMESTAMP), but the table key
@@ -485,7 +486,10 @@ index 096543c..2cdaeaf 100644
 +        }
 +        return out
 +    }
-+
+ 
+-        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
+-        val exportedNotifyIntent = Intent(action)
+-        mContext.sendBroadcast(exportedNotifyIntent)
 +    /** One pass over the table collecting per-column cardinality and range. */
 +    private fun columnStats(
 +        db: android.database.sqlite.SQLiteDatabase,
@@ -873,46 +877,62 @@ index 096543c..2cdaeaf 100644
 +
 +    /** Returns true when the manifest reached the export directory. */
 +    /**
-+     * Move manifests from an older schema out of the way.
++     * Move manifests that describe a different schema out of the `manifest-*.json` glob.
 +     *
-+     * A consumer globs `manifest-*.json` and takes the newest. When the schema is bumped the old
-+     * files stay in the directory and describe a different shape, which is exactly the kind of
-+     * thing that turns into a silent mis-parse. So: keep the schema this exporter last wrote in
-+     * `export_schema.txt`, and if it differs from the current constant, rename every existing
-+     * manifest to `manifest-<stamp>.json.v<old>.stale` — out of the glob, still on disk.
++     * The decision is made from each manifest's own `schema` field, not from a marker file and
++     * not from the file name. A marker can be wrong — writing the wrong number into it once (as
++     * happened during testing on 2026-11-17) would otherwise hide perfectly good current-schema
++     * batches from every consumer, and a consumer that takes "the newest manifest" would then
++     * read an older batch while believing it is current.
++     *
++     * The renamed file keeps its stamp (`manifest-<stamp>.json.v<n>.stale`), so it still ages out
++     * under the normal retention rule, and nothing is deleted here.
 +     */
 +    private fun relocateStaleManifests(location: Uri) {
 +        try {
-+            val marker = java.io.File(mContext.getExternalFilesDir(null), "export_schema.txt")
-+            val previous = try {
-+                if (marker.exists()) marker.readText().trim().toInt() else 0
-+            } catch (e: Exception) {
-+                0
-+            }
-+            if (previous == SCHEMA_VERSION) {
-+                return
-+            }
-+            if (previous != 0) {
-+                var moved = 0
-+                for (name in listDocuments(location).keys) {
-+                    if (!name.startsWith("manifest-") || !name.endsWith(".json")) continue
-+                    val target = "$name.v$previous.stale"
-+                    try {
-+                        val renamed = DocumentsContract.renameDocument(
-+                            mContext.contentResolver, documentUri(location, name), target
-+                        )
-+                        if (renamed != null) {
-+                            moved++
-+                        }
-+                    } catch (e: Exception) {
-+                        LOG.warn("could not relocate {}: {}", name, e.message)
-+                    }
++            var moved = 0
++            var kept = 0
++            for (name in listDocuments(location).keys) {
++                if (!name.startsWith("manifest-") || !name.endsWith(".json")) continue
++                val schema = manifestSchema(location, name)
++                if (schema == null || schema == SCHEMA_VERSION) {
++                    kept++
++                    continue
 +                }
-+                LOG.info("Schema {} -> {}: relocated {} old manifests", previous, SCHEMA_VERSION, moved)
++                val target = "$name.v$schema.stale"
++                try {
++                    val renamed = DocumentsContract.renameDocument(
++                        mContext.contentResolver, documentUri(location, name), target
++                    )
++                    if (renamed != null) {
++                        moved++
++                        LOG.info("Relocated {} (schema {}) to {}", name, schema, target)
++                    }
++                } catch (e: Exception) {
++                    LOG.warn("could not relocate {}: {}", name, e.message)
++                }
 +            }
-+            marker.writeText(SCHEMA_VERSION.toString())
++            if (moved > 0) {
++                LOG.info("Relocated {} manifests of an older schema, kept {} current", moved, kept)
++            }
 +        } catch (e: Exception) {
 +            LOG.warn("relocateStaleManifests failed", e)
++        }
++    }
++
++    /** The `schema` number inside a manifest, or null when it cannot be read. */
++    private fun manifestSchema(location: Uri, name: String): Int? {
++        return try {
++            val head = mContext.contentResolver.openInputStream(documentUri(location, name))?.use { input ->
++                // The field is near the start (`{"schema":6,...`); no need to read a whole batch.
++                val buf = ByteArray(256)
++                val n = input.read(buf)
++                if (n <= 0) "" else String(buf, 0, n, Charsets.UTF_8)
++            } ?: return null
++            Regex("\"schema\"\\s*:\\s*(\\d+)").find(head)?.groupValues?.get(1)?.toIntOrNull()
++        } catch (e: Exception) {
++            LOG.warn("could not read the schema of {}: {}", name, e.message)
++            null
 +        }
 +    }
 +
@@ -1062,7 +1082,7 @@ index 096543c..2cdaeaf 100644
 +
 +            val notes = JsonArray()
 +            notes.add("CSV layout: epoch_s,utc,<original columns>. epoch_s is derived from the table time column.")
-+            notes.add("raw_kind: 6=light sleep, 7=deep sleep, 8=REM, 1=steps, -1=unclassified")
++            notes.add("raw_kind: 6=light sleep, 7=deep sleep, 1=steps/unknown, -1=unclassified; 8 is NOT REM (upstream maps REM to 0x5656, which this request path never yields) so treat 8 as an unknown type")
 +            notes.add("spo: percent, -1 = not measured; roughly every 5 minutes")
 +            notes.add("heart_rate / resting_heart_rate: bpm, -1 = not measured")
 +            notes.add("nulls: a cell is empty for SQL NULL; -1 is a sentinel meaning 'no data', not a measurement")
@@ -1084,10 +1104,9 @@ index 096543c..2cdaeaf 100644
 +        } catch (e: Exception) {
 +            LOG.error("Failed writing manifest", e)
 +            return false
-         }
++        }
 +    }
- 
--        LOG.info("Broadcasting database export success={}", success)
++
 +    /**
 +     * A visible manifest tells the consumer that the batch is complete, so it must never be
 +     * visible half-written: write it under a temporary name, then rename it. If the provider
@@ -1126,10 +1145,7 @@ index 096543c..2cdaeaf 100644
 +            out.write(bytes)
 +        }
 +    }
- 
--        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
--        val exportedNotifyIntent = Intent(action)
--        mContext.sendBroadcast(exportedNotifyIntent)
++
 +    private fun deviceJson(db: android.database.sqlite.SQLiteDatabase): JsonObject {
 +        val o = JsonObject()
 +        try {
