@@ -115,13 +115,24 @@ def main():
             print(f"WARNING: {out_of_order} beats go backwards in time, framing is suspect")
     print(f"ACC={len(acc)}  beats={len(beats)}")
     if acc:
-        # How much the body moved, per axis, over the whole night (0..255 scale).
-        per_axis = list(zip(*[a[1] for a in acc]))
-        print("movement per axis (mean of 0x00-0xff activity): "
-              + " ".join("%.0f" % (sum(x) / len(x)) for x in per_axis))
-        movers = sum(1 for a in acc if max(a[1]) >= 0x80)
-        print(f"ACC samples with any axis >= 0x80: {movers} of {len(acc)}"
-              f" ({100.0 * movers / len(acc):.0f}%)")
+        # The two bytes after the timestamp are NOT three per-axis activity values. Read as a
+        # little-endian 16-bit word they are a bitmap: one bit per ~4 s slot (16 x 4 s = the 64 s
+        # ACC interval), 1 = movement in that slot. 0xFFFF means the watch was not on the wrist
+        # (or was on the charger) for the whole interval, so it is a wear flag, not movement.
+        off = sum(1 for a in acc if (a[1][0] << 8 | a[1][1]) == 0xFFFF)
+        still = sum(1 for a in acc if (a[1][0] << 8 | a[1][1]) == 0x0000)
+        moved = [
+            bin((a[1][0] << 8) | a[1][1]).count("1")
+            for a in acc
+            if (a[1][0] << 8 | a[1][1]) not in (0x0000, 0xFFFF)
+        ]
+        print("ACC wear flag 0xFFFF (not on the wrist): %d of %d (%.0f%%)"
+              % (off, len(acc), 100.0 * off / len(acc)))
+        print("ACC all-zero slots (no movement)       : %d of %d (%.0f%%)"
+              % (still, len(acc), 100.0 * still / len(acc)))
+        if moved:
+            print("ACC moving slots in the rest           : mean %.1f of 16"
+                  % (sum(moved) / len(moved)))
     if not beats:
         return
 
@@ -129,7 +140,7 @@ def main():
     hrs = (t1 - t0) / 3600000
     print(f"span {datetime.fromtimestamp(t0/1000, tz=timezone.utc).astimezone():%H:%M} -> "
           f"{datetime.fromtimestamp(t1/1000, tz=timezone.utc).astimezone():%H:%M}  ({hrs:.2f} h)")
-    print(f"mean HR ≈ {len(beats) / hrs / 60:.1f} bpm")
+    print("mean HR approx %.1f bpm" % (len(beats) / hrs / 60))
 
     # per 10-minute windows
     buckets = defaultdict(list)
