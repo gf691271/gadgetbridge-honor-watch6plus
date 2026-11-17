@@ -119,10 +119,10 @@ index 5bb5f45..abfac1a 100644
  }
 +
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-index 096543c..e17b30a 100644
+index 096543c..94fd228 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
-@@ -2,82 +2,1188 @@ package nodomain.freeyourgadget.gadgetbridge.database
+@@ -2,82 +2,1204 @@ package nodomain.freeyourgadget.gadgetbridge.database
  
  import android.content.Context
  import android.content.Intent
@@ -497,7 +497,7 @@ index 096543c..e17b30a 100644
 +            parts.add("COUNT(DISTINCT ${it.first})")
 +            parts.add("MIN(${it.first})")
 +            parts.add("MAX(${it.first})")
-+        }
+         }
 +        val out = mutableListOf<ColStat>()
 +        try {
 +            db.rawQuery("SELECT ${parts.joinToString(",")} FROM ${spec.table}$whereSql", null).use { c ->
@@ -518,7 +518,8 @@ index 096543c..e17b30a 100644
 +        }
 +        return out
 +    }
-+
+ 
+-        LOG.info("Broadcasting database export success={}", success)
 +    private fun qualityJson(rows: Int, stats: List<ColStat>, gaps: List<Long>): JsonObject {
 +        val q = JsonObject()
 +        q.addProperty("rows", rows)
@@ -535,7 +536,10 @@ index 096543c..e17b30a 100644
 +        }
 +        return q
 +    }
-+
+ 
+-        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
+-        val exportedNotifyIntent = Intent(action)
+-        mContext.sendBroadcast(exportedNotifyIntent)
 +    private fun csvCell(c: Cursor, index: Int): String {
 +        return when (c.getType(index)) {
 +            Cursor.FIELD_TYPE_NULL -> ""
@@ -548,7 +552,7 @@ index 096543c..e17b30a 100644
 +                    "\"" + s.replace("\"", "\"\"") + "\""
 +                } else s
 +            }
-         }
++        }
 +    }
 +
 +    // ---- raw blobs -----------------------------------------------------------
@@ -620,6 +624,13 @@ index 096543c..e17b30a 100644
 +                    removeDuplicates(location, existing, target)
 +                    continue
 +                }
++                // The same night can be fetched again under a different name; archive it once,
++                // by content, or the directory fills with duplicates.
++                if (index.any { it.value == sha && it.key != target }) {
++                    unchanged++
++                    removeDuplicates(location, existing, target)
++                    continue
++                }
 +                val uri = if (current != null) {
 +                    overwriteDocument(location, current.uri, data)
 +                } else {
@@ -646,22 +657,31 @@ index 096543c..e17b30a 100644
 +    }
 +
 +    /** Stable archive name: drop the per-request timestamp from dump snapshot names. */
-+    private fun archiveName(f: java.io.File): String {
-+        val base = if (f.parentFile?.name == "dump") {
-+            f.name.replace(Regex("_\\d{10,}(\\.bin)$"), "$1")
-+        } else {
-+            f.name
-+        }
-+        return "raw-$base"
-+    }
++    /**
++     * Archive name for a source file.
++     *
++     * Dump snapshots keep the fetch time in their name (`sleep_data_<epoch_ms>.bin`). Earlier
++     * this stripped it, on the theory that only the newest whole-window dump mattered — but the
++     * blob is now the primary beat-level source, one per night, and a stable name overwrote
++     * every earlier night. The fetch time is unique, sorts correctly, and the blob itself
++     * carries the session time once decoded.
++     *
++     * Identical content is still collapsed: the copy loop skips a blob whose sha256 is already
++     * archived under another name.
++     */
++    private fun archiveName(f: java.io.File): String = "raw-" + f.name
 +
-+    /** Old exports left `raw-sleep_data_1794…bin` snapshots; the stable name supersedes them. */
++    /**
++     * One-off cleanup of `raw-sleep_data.bin` / `raw-sleep_state.bin`, the stable names an
++     * earlier build used, which by construction only ever held the newest blob. Timestamped
++     * snapshots are NOT removed any more: each one is a separate night.
++     */
 +    private fun removeLegacySnapshots(
 +        location: Uri,
 +        existing: Map<String, Archived>,
 +        index: MutableMap<String, String>
 +    ) {
-+        val legacy = Regex("^raw-.+_\\d{10,}\\.bin$")
++        val legacy = Regex("^raw-(sleep_data|sleep_state)\\.bin$")
 +        for ((name, doc) in existing) {
 +            if (!legacy.matches(name)) continue
 +            try {
@@ -692,8 +712,7 @@ index 096543c..e17b30a 100644
 +        }
 +        return out
 +    }
- 
--        LOG.info("Broadcasting database export success={}", success)
++
 +    private fun writeArchiveIndex(index: Map<String, String>) {
 +        try {
 +            val o = JsonObject()
@@ -779,10 +798,7 @@ index 096543c..e17b30a 100644
 +            }
 +        }
 +    }
- 
--        val action: String = if (success) ACTION_DATABASE_EXPORT_SUCCESS else ACTION_DATABASE_EXPORT_FAIL
--        val exportedNotifyIntent = Intent(action)
--        mContext.sendBroadcast(exportedNotifyIntent)
++
 +    private fun displayName(uri: Uri): String? = try {
 +        mContext.contentResolver.query(
 +            uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null

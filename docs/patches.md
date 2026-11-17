@@ -424,3 +424,12 @@ ACC 时间戳 100% 递增、拍间隔 100% 落在 300–2000 ms。
 用途：怀疑实时流会占用光学传感器、影响手表自己录睡眠文件时，
 可以在单变量条件下测 TruSleep，不必临时改常量再改回来。
 `tools/rri-stream-switch.py` 负责切换并**读回校验**。
+
+### blob 归档：每晚一份（0011）
+
+原来是稳定名 `raw-sleep_data.bin`，**每晚覆盖上一晚**。blob 现在是逐拍主数据源，
+一份只能留一晚是不可接受的。
+
+现在按抓取时间命名 `raw-sleep_data_<epoch_ms>.bin`（唯一且可排序，内容解出来就是睡眠时段），
+并按 sha256 去重。`removeLegacySnapshots()` 只清 `raw-sleep_data.bin` 这类旧稳定名，
+不再删带时间戳的快照。

@@ -1,0 +1,97 @@
+From a3d5961c38241af98db91a41261b8fc7da28628d Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 09:45:59 +0800
+Subject: [PATCH] fix: keep one archived blob per night instead of one ever
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The raw sleep blob used to be archived under a stable name, on the theory that only the
+newest whole-window dump mattered. Since 2026-11-17 the blob is the primary beat-level
+source — one per night — and the stable name meant every new night overwrote the previous
+one in the export directory.
+
+Dump snapshots now keep the fetch time in their archive name
+(raw-sleep_data_<epoch_ms>.bin). The fetch time is unique, sorts correctly, and the blob
+carries the session time once decoded.
+
+Identical content is still collapsed: a blob whose sha256 is already archived under another
+name is skipped, so re-fetching the same night does not duplicate it.
+
+removeLegacySnapshots() now only deletes raw-sleep_data.bin / raw-sleep_state.bin, the two
+stable names an earlier build produced. Timestamped snapshots are no longer deleted, because
+each one is a separate night.
+
+Night of 2026-11-16 -> 17, the first one captured with the stream off and TruSleep on:
+  112,632 bytes, ACC 530, PPG 781, 27,156 beats, 22:44 -> 08:11 (9.43 h)
+  framing checks C1-C6 all pass, 02:00-08:00 continuous at 55-65 bpm
+  off-wrist marker (255,255) covers 74.7 min, matching the user's reported habits
+
+Compiled: assembleMainlineDebug BUILD_OK.
+---
+ .../database/DatabaseExportWorker.kt          | 36 +++++++++++++------
+ 1 file changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+index e17b30a..94fd228 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/database/DatabaseExportWorker.kt
+@@ -478,6 +478,13 @@ class DatabaseExportWorker(
+                     removeDuplicates(location, existing, target)
+                     continue
+                 }
++                // The same night can be fetched again under a different name; archive it once,
++                // by content, or the directory fills with duplicates.
++                if (index.any { it.value == sha && it.key != target }) {
++                    unchanged++
++                    removeDuplicates(location, existing, target)
++                    continue
++                }
+                 val uri = if (current != null) {
+                     overwriteDocument(location, current.uri, data)
+                 } else {
+@@ -504,22 +511,31 @@ class DatabaseExportWorker(
+     }
+ 
+     /** Stable archive name: drop the per-request timestamp from dump snapshot names. */
+-    private fun archiveName(f: java.io.File): String {
+-        val base = if (f.parentFile?.name == "dump") {
+-            f.name.replace(Regex("_\\d{10,}(\\.bin)$"), "$1")
+-        } else {
+-            f.name
+-        }
+-        return "raw-$base"
+-    }
++    /**
++     * Archive name for a source file.
++     *
++     * Dump snapshots keep the fetch time in their name (`sleep_data_<epoch_ms>.bin`). Earlier
++     * this stripped it, on the theory that only the newest whole-window dump mattered — but the
++     * blob is now the primary beat-level source, one per night, and a stable name overwrote
++     * every earlier night. The fetch time is unique, sorts correctly, and the blob itself
++     * carries the session time once decoded.
++     *
++     * Identical content is still collapsed: the copy loop skips a blob whose sha256 is already
++     * archived under another name.
++     */
++    private fun archiveName(f: java.io.File): String = "raw-" + f.name
+ 
+-    /** Old exports left `raw-sleep_data_1794…bin` snapshots; the stable name supersedes them. */
++    /**
++     * One-off cleanup of `raw-sleep_data.bin` / `raw-sleep_state.bin`, the stable names an
++     * earlier build used, which by construction only ever held the newest blob. Timestamped
++     * snapshots are NOT removed any more: each one is a separate night.
++     */
+     private fun removeLegacySnapshots(
+         location: Uri,
+         existing: Map<String, Archived>,
+         index: MutableMap<String, String>
+     ) {
+-        val legacy = Regex("^raw-.+_\\d{10,}\\.bin$")
++        val legacy = Regex("^raw-(sleep_data|sleep_state)\\.bin$")
+         for ((name, doc) in existing) {
+             if (!legacy.matches(name)) continue
+             try {
+-- 
+2.55.0.windows.2
+
