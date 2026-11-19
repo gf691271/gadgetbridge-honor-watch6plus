@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 02:40:00 +0800
+Subject: [PATCH] fix: write sleep_state segments as rows again, and let the busy
+ watchdog reset a stuck sync
+
+Two bugs found on the device on 2026-11-19/20.
+
+1. Since 0012 the sleep_state request uses an archive-only callback. Its syncComplete()
+   was the empty base method, so the segments were saved as raw blobs but no longer
+   written as rows (SOURCE 0x0a, kind 6). The callback now writes them again. It does
+   not stop the activity sync a second time: the fitness-totals finaliser already does.
+
+2. A sync whose activity fetch got no answer kept HuaweiSyncState.activitySync set.
+   The busy watchdog cleared the busy flag after 10 minutes but not the sync flags, so
+   every later sync (periodic, manual, intent) was dropped as "already queued" until
+   Gadgetbridge restarted. This happened on 2026-11-18 14:00 and lasted 34 hours. The
+   watchdog now also calls HuaweiSyncState.resetStuck().
+
+Device check (2026-11-20 02:30): installed over the 11-17 build, two syncs completed,
+"SLEEPSTATE_ROWS segments=5" logged, the export contains the SOURCE 10 kind 6 rows.
+---
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index 6abc1be..f84b0bb 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -2945,6 +2945,9 @@ public class HuaweiSupportProvider {
+                     if (stuckMinutes >= 10) {
+                         LOG.error("BUSY_WATCHDOG clearing stuck task {}", gbDevice.getBusyTask());
+                         gbDevice.unsetBusyTask();
++                        // The sync that never finished also left its flags set; without this every
++                        // later sync is dropped as "already queued" until GB restarts.
++                        syncState.resetStuck();
+                         stuckMinutes = 0;
+                         stuckTask = null;
+                     }
+@@ -3804,6 +3807,24 @@ public class HuaweiSupportProvider {
+                         }
+                         super.downloadComplete(fr, raw);
+                     }
++
++                    @Override
++                    public void syncComplete(byte[] statusData, byte[] sleepData) {
++                        // Local patch: write each sleep segment as one row again (SOURCE 0x0a,
++                        // kind 6). The archive-only callback above had dropped this step. The
++                        // fitness-totals finaliser already stops the activity sync, so this does
++                        // not stop it a second time.
++                        if (statusData == null || statusData.length == 0)
++                            return;
++                        HuaweiTruSleepParser.TruSleepStatus[] results = HuaweiTruSleepParser.parseState(statusData);
++                        if (results.length == 0)
++                            return;
++                        List<Triple<Integer, Integer, Byte>> rows = new ArrayList<>(results.length);
++                        for (HuaweiTruSleepParser.TruSleepStatus status : results)
++                            rows.add(new Triple<>(status.startTime, status.endTime, (byte) 0x06));
++                        addSleepActivities(rows, (byte) 0x0a);
++                        LOG.info("SLEEPSTATE_ROWS segments={}", results.length);
++                    }
+                 }
+         ), true);
+         // Local patch: the sleep_data request that used to be queued here was removed.
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
+index 4a18e39..8ddba88 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
+@@ -165,6 +165,20 @@ class HuaweiSyncState {
+         updateState();
+     }
+ 
++    /** Local patch: called by the busy watchdog when a sync never finished. */
++    public void resetStuck() {
++        synchronized (this) {
++            LOG.warn("SYNC_RESET active={} queue={}", activeSync(), syncQueue);
++            activitySync = false;
++            p2pSync = false;
++            stressSync = false;
++            ecgSync = false;
++            workoutSync = false;
++            workoutGpsDownload = 0;
++            syncQueue.clear();
++        }
++    }
++
+     public void updateState() {
+         updateState(true);
+     }
+-- 
+2.47.0
