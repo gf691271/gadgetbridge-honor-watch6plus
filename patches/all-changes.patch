@@ -2043,7 +2043,7 @@ index 583c919..ab41586 100644
  
              @Override
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
-index 19582f3..6abc1be 100644
+index 19582f3..f84b0bb 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
 @@ -42,6 +42,7 @@ import org.slf4j.Logger;
@@ -2781,7 +2781,7 @@ index 19582f3..6abc1be 100644
          for (int i = 1; i > -1; i <<= 1) {
              if ((dataTypes & i) != 0) {
                  switch (i) {
-@@ -2224,6 +2924,66 @@ public class HuaweiSupportProvider {
+@@ -2224,6 +2924,69 @@ public class HuaweiSupportProvider {
          }
      }
  
@@ -2806,6 +2806,9 @@ index 19582f3..6abc1be 100644
 +                    if (stuckMinutes >= 10) {
 +                        LOG.error("BUSY_WATCHDOG clearing stuck task {}", gbDevice.getBusyTask());
 +                        gbDevice.unsetBusyTask();
++                        // The sync that never finished also left its flags set; without this every
++                        // later sync is dropped as "already queued" until GB restarts.
++                        syncState.resetStuck();
 +                        stuckMinutes = 0;
 +                        stuckTask = null;
 +                    }
@@ -2848,7 +2851,7 @@ index 19582f3..6abc1be 100644
      public void setSleepBreath() {
          if (huaweiDataSyncSleepApnea != null) {
              boolean sleepBreathSwitch = GBApplication
-@@ -2832,6 +3592,10 @@ public class HuaweiSupportProvider {
+@@ -2832,6 +3595,10 @@ public class HuaweiSupportProvider {
      }
  
      public void dispose() {
@@ -2859,7 +2862,7 @@ index 19582f3..6abc1be 100644
          stopBatteryRunnerDelayed();
          huaweiFileDownloadManager.dispose();
          huaweiP2PManager.unregisterAllService();
-@@ -2978,14 +3742,19 @@ public class HuaweiSupportProvider {
+@@ -2978,14 +3745,19 @@ public class HuaweiSupportProvider {
      }
  
      public boolean downloadTruSleepData(int start, int end) {
@@ -2882,7 +2885,7 @@ index 19582f3..6abc1be 100644
              @Override
              public void syncComplete(byte[] statusData, byte[] sleepData) {
                  LOG.debug("Sync of TruSleep status and data finished");
-@@ -3014,24 +3783,264 @@ public class HuaweiSupportProvider {
+@@ -3014,24 +3786,282 @@ public class HuaweiSupportProvider {
              }
          };
  
@@ -2915,6 +2918,24 @@ index 19582f3..6abc1be 100644
 +                            saveSmallBlob("sleep_state", payload);
 +                        }
 +                        super.downloadComplete(fr, raw);
++                    }
++
++                    @Override
++                    public void syncComplete(byte[] statusData, byte[] sleepData) {
++                        // Local patch: write each sleep segment as one row again (SOURCE 0x0a,
++                        // kind 6). The archive-only callback above had dropped this step. The
++                        // fitness-totals finaliser already stops the activity sync, so this does
++                        // not stop it a second time.
++                        if (statusData == null || statusData.length == 0)
++                            return;
++                        HuaweiTruSleepParser.TruSleepStatus[] results = HuaweiTruSleepParser.parseState(statusData);
++                        if (results.length == 0)
++                            return;
++                        List<Triple<Integer, Integer, Byte>> rows = new ArrayList<>(results.length);
++                        for (HuaweiTruSleepParser.TruSleepStatus status : results)
++                            rows.add(new Triple<>(status.startTime, status.endTime, (byte) 0x06));
++                        addSleepActivities(rows, (byte) 0x0a);
++                        LOG.info("SLEEPSTATE_ROWS segments={}", results.length);
 +                    }
 +                }
          ), true);
@@ -3157,7 +3178,7 @@ index 19582f3..6abc1be 100644
  
          syncState.setStressSync(true);
  
-@@ -3305,3 +4314,30 @@ public class HuaweiSupportProvider {
+@@ -3305,3 +4335,30 @@ public class HuaweiSupportProvider {
      }
  
  }
@@ -3188,6 +3209,31 @@ index 19582f3..6abc1be 100644
 +
 +
 +
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
+index 4a18e39..8ddba88 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
+@@ -165,6 +165,20 @@ class HuaweiSyncState {
+         updateState();
+     }
+ 
++    /** Local patch: called by the busy watchdog when a sync never finished. */
++    public void resetStuck() {
++        synchronized (this) {
++            LOG.warn("SYNC_RESET active={} queue={}", activeSync(), syncQueue);
++            activitySync = false;
++            p2pSync = false;
++            stressSync = false;
++            ecgSync = false;
++            workoutSync = false;
++            workoutGpsDownload = 0;
++            syncQueue.clear();
++        }
++    }
++
+     public void updateState() {
+         updateState(true);
+     }
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java
 index 448962a..b2f8f43 100644
 --- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/ResponseManager.java

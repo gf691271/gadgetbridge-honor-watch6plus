@@ -1,14 +1,16 @@
 # 补丁清单
 
-合集：`patches/all-changes.patch`（31 个文件，+3860 / -92）
+合集：`patches/all-changes.patch`（34 个文件，+4294 / -96，包含 0001–0015）
 应用：`git apply patches/all-changes.patch`
 按提交拆分的版本：`patches/0001-*.patch`（5 个提交）+ `patches/0002-*.patch`（2026-11-14 评审修复，1 个提交）
 + `patches/0003-*.patch`（2026-11-15 类型映射 / 队列 / 单次下载，1 个提交）
 + `patches/0004-*.patch`（2026-11-15 研究用：能力位 dump / 类型字节扫描 / dict 睡眠，1 个提交）
 + `patches/0005-*.patch`（2026-11-16 链路静默死亡的检测，1 个提交）
 + `patches/0006-*.patch`（2026-11-16 保活闹钟：15 分钟只做重连，1 个提交）
-+ `patches/0007-*.patch`（2026-11-16 只在通道真的安静时才重发开流，1 个提交），
-用 `git am` 按顺序套，结果与合集逐字节一致。
++ `patches/0007-*.patch`（2026-11-16 只在通道真的安静时才重发开流，1 个提交）
++ `patches/0008-*.patch` 到 `patches/0015-*.patch`（2026-11-16 到 11-20，各 1 个提交，说明见下面各节），
+用 `git am` 按顺序套，结果与合集逐字节一致（2026-11-20 重新生成合集时验证过）。
+注意：`0004` 文件里的第 1 个提交就是 `0003`，套到这里会报冲突，用 `git am --skip` 跳过它再继续。
 
 基线是上游 `master` 的提交 `6a322305eae857436e77b3a0f5b3ebc438b047e9`（不是 `0.95.1` tag，见
 [`upstream-baseline.md`](upstream-baseline.md)）。已在这个提交上验证 `git apply --check` 通过。
