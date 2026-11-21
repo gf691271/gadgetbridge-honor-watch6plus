@@ -422,8 +422,7 @@ sleepDataFileRequest(..., wideStart, wideEnd, callback);
 | 文件 | 内容 |
 |---|---|
 | `data/sleep_data_full.bin` | 78052 字节原始数据 |
-| `data/csv/sleep_beats.csv` | ≈20000 个逐拍（epoch_ms, peak, amp） |
-| `data/csv/sleep_acc.csv` | 387 条 ACC 记录（flags） |
+| `data/csv/`（本地输出，不入库） | `decode_sleep_beats.py` 写出的逐拍表和 ACC 表；这是个人健康数据，不放进公开仓库 |
 | `tools/parse_trusleep.py` | TruSleep 格式解析（Python 移植） |
 | `tools/decode_sleep_beats.py` | 逐拍解码 + 每 10 分钟心率 |
 | `tools/runs_bin.py` | 结构探测 |

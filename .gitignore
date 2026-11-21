@@ -5,3 +5,5 @@ build/
 .gradle/
 __pycache__/
 *.pyc
+# Decoded per-beat and motion tables are personal health data; keep them local.
+data/csv/

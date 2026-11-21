@@ -138,7 +138,6 @@ in place because it costs nothing to keep.
 | [`docs/upstream-baseline.md`](docs/upstream-baseline.md) | The 0.95.1 baseline, what upstream already fixed, how to rebase |
 | [`docs/watch-files.md`](docs/watch-files.md) | Files on the watch and what they contain |
 | [`docs/pipeline.md`](docs/pipeline.md) | Analysis pipeline |
-| [`docs/apnea-analysis.md`](docs/apnea-analysis.md) | Definitions and thresholds for the breathing-related metrics |
 | [`docs/next-steps.md`](docs/next-steps.md) | Open work |
 | [`docs/review-2026-11-14.md`](docs/review-2026-11-14.md) | Code review of the patch set: what was fixed, what still needs the watch |
 

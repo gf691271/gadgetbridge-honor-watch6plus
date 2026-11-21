@@ -129,7 +129,6 @@ Gadgetbridge 一直显示"认证中"，日志里是
 | [`docs/upstream-baseline.md`](docs/upstream-baseline.md) | 0.95.1 基线、上游已修的 bug、如何重新套补丁 |
 | [`docs/watch-files.md`](docs/watch-files.md) | 手表上的文件与含义 |
 | [`docs/pipeline.md`](docs/pipeline.md) | 分析流水线 |
-| [`docs/apnea-analysis.md`](docs/apnea-analysis.md) | 呼吸相关指标的定义与阈值 |
 | [`docs/next-steps.md`](docs/next-steps.md) | 未完成事项 |
 | [`docs/review-2026-11-14.md`](docs/review-2026-11-14.md) | 补丁代码评审：已修的问题、还要在真机上确认的问题 |
 

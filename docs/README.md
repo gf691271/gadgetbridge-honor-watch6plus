@@ -8,7 +8,6 @@
 | `upstream-baseline.md` | 基线版本与升级步骤 |
 | `watch-files.md` | 手表上的文件与含义 |
 | `pipeline.md` | 分析流水线 |
-| `apnea-analysis.md` | 呼吸暂停指标定义与阈值 |
 | `reproduction.md` | 复现验收：哪些值要换、哪些必须一致、五步验证 |
 | `next-steps.md` | 未完成事项 |
 | `status-2026-11-10.md` | 历史快照（保留作参考） |
