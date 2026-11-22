@@ -1,0 +1,356 @@
+From 54d650be33bcba9f94cc6e7f6886e74aa3777893 Mon Sep 17 00:00:00 2001
+From: gf691271 <gf691271@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:21:12 -0800
+Subject: [PATCH] fix: a stalled sync recovers by itself, the blob waits for
+ the sync, heart rates above 127 stay positive
+
+Four findings from the 2026-11-22 review, measured on 11-21.
+
+1. The busy watchdog cleared the flag but did not bring the watch back. The 02:00 sync stalled
+   (the fourth 0x07/0x0d got no answer), the watchdog cleared it at 02:28, and the 08:00 sync
+   stalled again (0x07/0x0c got no answer at all). Only a phone restart at 11:54 recovered the
+   link; on 11-18 a stall lasted 34 hours. The watchdog now also closes the socket, which sends
+   the normal reconnect path, and after the reconnect asks for one fresh sync (at most one such
+   resync per 30 minutes). It also measures by the wall clock: its "10 ticks" of 60 s took 27 and
+   32 minutes in doze.
+
+2. The sleep_data.bin download no longer runs next to the activity sync. Both stalled syncs had
+   it downloading beside the 0x07 requests. That the overlap causes the stall is not proven (the
+   20:00 sync overlapped too and finished), but nothing is lost by running them one after the
+   other: a sync now marks the download as owed, and HuaweiSyncState starts it once no sync is
+   active. On connect it waits a minute, so a sync that arrives with the connection goes first,
+   and two requests within two minutes become one.
+
+3. GetStepDataRequest cast the heart rate, SpO2 and resting heart rate back to byte after
+   FitnessData had read them unsigned (0012), so 130 bpm was stored as -126 again. The server held
+   six such rows (-127..-109) between 11-14 and 11-21. They are kept as int now; 0xFF still
+   means "not measured" (-1).
+
+4. The morning blob retries counted across days, so a long-lived process ran out of them (the
+   first attempt on 11-21 was already number 4). The count now starts again each day.
+
+Also: pref_rri_stream_enabled now defaults to false. The nightly blob replaced the stream, and a
+cleared preference file must not open it again (an open stream costs the watch 20 % a night).
+
+Compiled: assembleMainlineDebug BUILD_OK. TestFitnessDataSignHandling 4/4 and the new
+TestStepDataUnsignedSamples 2/2 pass. Installed 2026-11-22 04:37 (pm install -r): after the
+next sync the log shows "FULLDUMP sync idle, downloading now" and the blob downloaded only then;
+a second sync 28 s later logged "FULLDUMP skipped". The watchdog reconnect and the heart rate
+fix wait for a real stall and a workout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../devices/huawei/HuaweiSupportProvider.java | 117 +++++++++++++++---
+ .../devices/huawei/HuaweiSyncState.java       |   6 +
+ .../huawei/requests/GetStepDataRequest.java   |  17 ++-
+ .../requests/TestStepDataUnsignedSamples.java |  24 ++++
+ 4 files changed, 145 insertions(+), 19 deletions(-)
+ create mode 100644 app/src/test/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/TestStepDataUnsignedSamples.java
+
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+index f84b0bb..cc7f84e 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSupportProvider.java
+@@ -312,18 +312,22 @@ public class HuaweiSupportProvider {
+      * Needed because the stream may contend with the watch's own sleep recording: while it is
+      * open the optical sensor is being driven for the stream, and whether the watch still writes
+      * its own raw blob in that state has never been tested. Turning the stream off isolates the
+-     * TruSleep experiment. Default true, so nothing changes unless the flag is set.
++     * TruSleep experiment.
++     *
++     * Default false since 0016 (2026-11-22): the nightly blob (sleep_data.bin) replaced the
++     * stream, and an open stream costs the watch 20 % or more per night. A cleared preference
++     * file must not turn it back on by itself.
+      */
+     private boolean rriStreamEnabled() {
+         try {
+             if (gbDevice == null) {
+-                return true;
++                return false;
+             }
+             return nodomain.freeyourgadget.gadgetbridge.GBApplication
+                     .getDeviceSpecificSharedPrefs(gbDevice.getAddress())
+-                    .getBoolean("pref_rri_stream_enabled", true);
++                    .getBoolean("pref_rri_stream_enabled", false);
+         } catch (Exception e) {
+-            return true;
++            return false;
+         }
+     }
+ 
+@@ -733,12 +737,42 @@ public class HuaweiSupportProvider {
+         logCaptureEvent(insideRriWindow() ? "session_start_in_window" : "session_start_outside_window");
+     }
+ 
++    /** Local patch (0016): a blob download is owed and runs once the sync is idle. */
++    private boolean fullDumpAfterSync = false;
++    /** The connect path and the end of a sync can both ask within seconds; one download is enough. */
++    private static final long FULLDUMP_MIN_GAP_MS = 2 * 60 * 1000L;
++    private long lastFullDumpMs = 0L;
++
++    /** Called by HuaweiSyncState whenever no sync is active any more. */
++    public void onSyncIdle() {
++        if (fullDumpAfterSync) {
++            LOG.info("FULLDUMP sync idle, downloading now");
++            enqueueFullSleepDump();
++        }
++    }
++
+     /**
+      * Local research patch: request sleep data with a 48h window.
+      * Gadgetbridge's own path uses "since last sync" (~1.5h here), which makes the device
+      * answer with size=0, while a 48h window returns the full backlog (~78 KB).
+      */
+     private void enqueueFullSleepDump() {
++        // Local patch (0016): never run the blob download inside an activity sync. On 2026-11-21
++        // the 02:00 and 08:00 syncs both stalled while sleep_data.bin was downloading next to
++        // the 0x07 requests; whether the overlap causes the stall is not proven (the 20:00 sync
++        // overlapped too and finished), but nothing is lost by running the two one after another.
++        if (syncState.isActive()) {
++            fullDumpAfterSync = true;
++            LOG.info("FULLDUMP deferred until the sync finishes");
++            return;
++        }
++        fullDumpAfterSync = false;
++        long nowMs = System.currentTimeMillis();
++        if (nowMs - lastFullDumpMs < FULLDUMP_MIN_GAP_MS) {
++            LOG.info("FULLDUMP skipped, one was requested {} s ago", (nowMs - lastFullDumpMs) / 1000L);
++            return;
++        }
++        lastFullDumpMs = nowMs;
+         int end = (int) (System.currentTimeMillis() / 1000L);
+         int start = end - 48 * 3600;
+         huaweiFileDownloadManager.addToQueue(
+@@ -797,12 +831,22 @@ public class HuaweiSupportProvider {
+      */
+     private static final int SLEEP_RETRY_MAX = 6;
+     private int sleepRetryCount = 0;
++    /** Local patch (0016): day of year the count belongs to; it starts again every morning. */
++    private int sleepRetryDay = -1;
+     private final android.os.Handler sleepRetryHandler =
+             new android.os.Handler(android.os.Looper.getMainLooper());
+     private final Runnable sleepRetry = new Runnable() {
+         @Override
+         public void run() {
+-            int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
++            java.util.Calendar now = java.util.Calendar.getInstance();
++            int hour = now.get(java.util.Calendar.HOUR_OF_DAY);
++            int day = now.get(java.util.Calendar.DAY_OF_YEAR);
++            if (day != sleepRetryDay) {
++                // The count used to run across days: on 11-21 the first morning attempt was
++                // already number 4, so a long-lived process ran out of retries for good.
++                sleepRetryDay = day;
++                sleepRetryCount = 0;
++            }
+             if (hour < 7 || hour >= 13 || sleepRetryCount >= SLEEP_RETRY_MAX) {
+                 LOG.info("FULLDUMP retry finished (hour={}, attempts={})", hour, sleepRetryCount);
+                 return;
+@@ -1463,7 +1507,14 @@ public class HuaweiSupportProvider {
+             // the only source of native RR intervals; sleep_data only covers sleep.
+             startRriRepeat();
+             // Local research patch: pull the full sleep data with a wide window on connect.
+-            enqueueFullSleepDump();
++            // 0016: a minute later, so a sync that arrives with the connection goes first.
++            busyWatchdog.postDelayed(this::enqueueFullSleepDump, 60000);
++            if (resyncAfterReconnect) {
++                resyncAfterReconnect = false;
++                LOG.info("BUSY_WATCHDOG reconnected, requesting a fresh sync");
++                busyWatchdog.postDelayed(() -> GBApplication.deviceService(gbDevice)
++                        .onFetchRecordedData(RecordedDataTypes.TYPE_SYNC), 30000);
++            }
+             // Local research patch: re-apply the health measurement switches on every connect.
+             // Gadgetbridge only pushes these when the settings screen changes something, so a
+             // cleared or half-written preference file would otherwise silently stop the data.
+@@ -2286,7 +2337,8 @@ public class HuaweiSupportProvider {
+             }
+         }
+         // Local patch: archive the raw sleep blob on every sync, not only on connect.
+-        enqueueFullSleepDump();
++        // 0016: after the sync, not next to it (see enqueueFullSleepDump).
++        fullDumpAfterSync = true;
+         // Local patch: surface the new-sync capabilities so we can tell which download
+         // protocol the device wants (old aggregate vs new per-file).
+         LOG.info("NEWSYNC truSleep={} rri={} gps={}",
+@@ -2341,6 +2393,10 @@ public class HuaweiSupportProvider {
+             LOG.warn("Device is already busy with {}, so won't fetch data now.", gbDevice.getBusyTask());
+         else
+             fetchRecodedDataFromQueue();
++        if (fullDumpAfterSync && !syncState.isActive()) {
++            // No sync started (nothing queued, or busy with something else): do not owe it.
++            enqueueFullSleepDump();
++        }
+ 
+         // Get the battery level as well
+         getBatteryLevel();
+@@ -2926,33 +2982,51 @@ public class HuaweiSupportProvider {
+ 
+     /** Clear a stuck busy flag so one failed download cannot block every later sync. */
+     private final android.os.Handler busyWatchdog = new android.os.Handler(android.os.Looper.getMainLooper());
++    /**
++     * Local patch (0016): how long a task may hold the busy flag, by the wall clock. The check
++     * runs every minute, but in doze the handler is stretched: the old "10 ticks" took 27 and
++     * 32 minutes on 2026-11-21.
++     */
++    private static final long BUSY_STUCK_MS = 10 * 60 * 1000L;
++    /** At most one watchdog resync per this interval, so a watch that keeps stalling is not hammered. */
++    private static final long WATCHDOG_RESYNC_MIN_GAP_MS = 30 * 60 * 1000L;
++    private boolean resyncAfterReconnect = false;
++    private long lastWatchdogResyncMs = 0L;
+     private final Runnable busyCheck = new Runnable() {
+-        private int stuckMinutes = 0;
++        private long stuckSinceMs = 0L;
+         private String stuckTask = null;
+ 
+         @Override
+         public void run() {
+             try {
++                long now = System.currentTimeMillis();
+                 if (gbDevice != null && gbDevice.isBusy()) {
+                     String task = gbDevice.getBusyTask();
+-                    if (task == null || !task.equals(stuckTask)) {
++                    if (stuckSinceMs == 0L || task == null || !task.equals(stuckTask)) {
+                         // Another task holds the flag now, so the previous one did finish.
+                         stuckTask = task;
+-                        stuckMinutes = 0;
++                        stuckSinceMs = now;
+                     }
+-                    stuckMinutes++;
+-                    LOG.info("BUSY_WATCHDOG task={} minutes={}", gbDevice.getBusyTask(), stuckMinutes);
+-                    if (stuckMinutes >= 10) {
+-                        LOG.error("BUSY_WATCHDOG clearing stuck task {}", gbDevice.getBusyTask());
++                    LOG.info("BUSY_WATCHDOG task={} minutes={}", task, (now - stuckSinceMs) / 60000L);
++                    if (now - stuckSinceMs >= BUSY_STUCK_MS) {
++                        LOG.error("BUSY_WATCHDOG clearing stuck task {}, reconnecting", task);
+                         gbDevice.unsetBusyTask();
+                         // The sync that never finished also left its flags set; without this every
+                         // later sync is dropped as "already queued" until GB restarts.
+                         syncState.resetStuck();
+-                        stuckMinutes = 0;
++                        stuckSinceMs = 0L;
+                         stuckTask = null;
++                        // 0016: clearing the flags alone did not bring the watch back. On 11-21 the
++                        // 08:00 sync stalled again after the 02:28 clear, and only a phone restart
++                        // at 11:54 recovered it. A fresh link and one new sync do.
++                        if (now - lastWatchdogResyncMs >= WATCHDOG_RESYNC_MIN_GAP_MS) {
++                            lastWatchdogResyncMs = now;
++                            resyncAfterReconnect = true;
++                        }
++                        dropLinkForRecovery();
+                     }
+                 } else {
+-                    stuckMinutes = 0;
++                    stuckSinceMs = 0L;
+                     stuckTask = null;
+                 }
+             } catch (Exception e) {
+@@ -2962,6 +3036,17 @@ public class HuaweiSupportProvider {
+         }
+     };
+ 
++    /** Local patch (0016): close the socket so the normal reconnect path builds a new link. */
++    private void dropLinkForRecovery() {
++        try {
++            if (brSupport != null) {
++                brSupport.dropConnection();
++            }
++        } catch (Exception e) {
++            LOG.warn("BUSY_WATCHDOG dropConnection failed: {}", e.getMessage());
++        }
++    }
++
+     private void startBusyWatchdog() {
+         busyWatchdog.removeCallbacks(busyCheck);
+         busyWatchdog.postDelayed(busyCheck, 60000);
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
+index 8ddba88..b90ea95 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/HuaweiSyncState.java
+@@ -26,6 +26,11 @@ class HuaweiSyncState {
+         this.supportProvider = supportProvider;
+     }
+ 
++    /** Local patch (0016): lets the provider hold the blob download until the sync is idle. */
++    public boolean isActive() {
++        return isSyncActive();
++    }
++
+     private boolean isSyncActive() {
+         return activitySync || p2pSync || stressSync || ecgSync || workoutSync || workoutGpsDownload != 0;
+     }
+@@ -191,6 +196,7 @@ class HuaweiSyncState {
+             }
+             if (needSync)
+                 GB.signalActivityDataFinish(supportProvider.getDevice());
++            supportProvider.onSyncIdle();
+         }
+     }
+ }
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetStepDataRequest.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetStepDataRequest.java
+index 4e89837..65aa29c 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetStepDataRequest.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/GetStepDataRequest.java
+@@ -38,6 +38,14 @@ public class GetStepDataRequest extends Request {
+     short maxCount;
+     short count;
+ 
++    /**
++     * Local patch (0016): a single-byte sample as stored. 0xFF keeps its old meaning, "not
++     * measured" (-1); the byte cast used to produce that, and no heart rate or SpO2 is 255.
++     */
++    static int unsignedSample(int value) {
++        return value == 0xFF ? -1 : value;
++    }
++
+     public GetStepDataRequest(HuaweiSupportProvider support, short maxCount, short count) {
+         super(support);
+         this.serviceId = FitnessData.id;
+@@ -81,10 +89,13 @@ public class GetStepDataRequest extends Request {
+                     short steps = (short) subContainer.steps;
+                     short calories = (short) subContainer.calories;
+                     short distance = (short) subContainer.distance;
+-                    byte heartrate = (byte) subContainer.heartrate;
+-                    byte spo = (byte) subContainer.spo;
++                    // Local patch (0016): FitnessData already reads these single-byte values
++                    // unsigned (0012). Casting back to byte here turned 130 bpm into -126 again;
++                    // the server held six such rows (-127..-109) between 11-14 and 11-21.
++                    int heartrate = unsignedSample(subContainer.heartrate);
++                    int spo = unsignedSample(subContainer.spo);
+ 
+-                    byte restingHeartRate = (byte) subContainer.restingHeartRate;
++                    int restingHeartRate = unsignedSample(subContainer.restingHeartRate);
+ 
+                     if (steps == -1)
+                         steps = 0;
+diff --git a/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/TestStepDataUnsignedSamples.java b/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/TestStepDataUnsignedSamples.java
+new file mode 100644
+index 0000000..a92b396
+--- /dev/null
++++ b/app/src/test/java/nodomain/freeyourgadget/gadgetbridge/service/devices/huawei/requests/TestStepDataUnsignedSamples.java
+@@ -0,0 +1,24 @@
++package nodomain.freeyourgadget.gadgetbridge.service.devices.huawei.requests;
++
++import org.junit.Assert;
++import org.junit.Test;
++
++/**
++ * Local patch (0016): GetStepDataRequest used to cast the unsigned values from FitnessData back
++ * to byte, so 130 bpm was stored as -126. 0xFF must still mean "not measured".
++ */
++public class TestStepDataUnsignedSamples {
++    @Test
++    public void valuesAbove127StayPositive() {
++        Assert.assertEquals(72, GetStepDataRequest.unsignedSample(72));
++        Assert.assertEquals(128, GetStepDataRequest.unsignedSample(0x80));
++        Assert.assertEquals(147, GetStepDataRequest.unsignedSample(147));
++        Assert.assertEquals(254, GetStepDataRequest.unsignedSample(254));
++    }
++
++    @Test
++    public void notMeasuredStaysMinusOne() {
++        Assert.assertEquals(-1, GetStepDataRequest.unsignedSample(0xFF));
++        Assert.assertEquals(-1, GetStepDataRequest.unsignedSample(-1));
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+
